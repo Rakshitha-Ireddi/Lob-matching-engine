@@ -36,18 +36,25 @@ struct EngineStats {
 
 // Single-threaded price-time-priority matching core.
 //
-// Not thread safe by design: exactly one thread ever calls process(). The
-// gateway and market-data threads communicate with it through SPSC rings.
-// See docs/adr/0004-single-writer-engine.md.
-class MatchingEngine {
+// Templated on the order-book data structure so the exact same matching logic
+// can be benchmarked against the bitset book (`OrderBook`), the `std::map`
+// baseline (`MapOrderBook`) and the sorted-vector baseline
+// (`SortedVectorOrderBook`) -- see docs/benchmarks.md. `Book` must provide the
+// surface used below: in_band, add, remove, reduce_in_place, best_level,
+// best_bid/ask, spread, marketable_qty, order_count, empty, snapshot.
+//
+// Not thread safe by design: exactly one thread ever calls process(). See
+// docs/adr/0004-single-writer-engine.md.
+template <class Book>
+class BasicMatchingEngine {
 public:
-    explicit MatchingEngine(const EngineConfig& cfg);
+    explicit BasicMatchingEngine(const EngineConfig& cfg);
 
     // Process one command. Returns the events produced, valid until the next
     // call to process().
     std::span<const Event> process(const Command& cmd) noexcept;
 
-    [[nodiscard]] const OrderBook& book() const noexcept { return book_; }
+    [[nodiscard]] const Book& book() const noexcept { return book_; }
     [[nodiscard]] const EngineStats& stats() const noexcept { return stats_; }
     [[nodiscard]] Sequence sequence() const noexcept { return seq_; }
     [[nodiscard]] std::size_t resting_orders() const noexcept { return index_.size(); }
@@ -67,7 +74,7 @@ private:
     void emit_book_changed(TsNanos ts_in) noexcept;
 
     EngineConfig cfg_;
-    OrderBook book_;
+    Book book_;
     ObjectPool<Order> pool_;
     FlatPtrMap<Order*> index_;
 
@@ -81,5 +88,10 @@ private:
     Price last_bid_ = kNoPrice;
     Price last_ask_ = kNoPrice;
 };
+
+// The production configuration: bitset book.
+using MatchingEngine = BasicMatchingEngine<OrderBook>;
+
+extern template class BasicMatchingEngine<OrderBook>;
 
 }  // namespace lob

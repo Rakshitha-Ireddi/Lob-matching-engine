@@ -3,9 +3,13 @@
 
 #include <algorithm>
 
+#include "lob/map_order_book.hpp"
+#include "lob/sorted_vector_order_book.hpp"
+
 namespace lob {
 
-MatchingEngine::MatchingEngine(const EngineConfig& cfg)
+template <class Book>
+BasicMatchingEngine<Book>::BasicMatchingEngine(const EngineConfig& cfg)
     : cfg_(cfg),
       book_(cfg.min_price, cfg.max_price),
       pool_(cfg.max_orders),
@@ -13,7 +17,8 @@ MatchingEngine::MatchingEngine(const EngineConfig& cfg)
     out_.reserve(64);
 }
 
-Event& MatchingEngine::new_event(EventType t) noexcept {
+template <class Book>
+Event& BasicMatchingEngine<Book>::new_event(EventType t) noexcept {
     out_.emplace_back();
     Event& e = out_.back();
     e.type = t;
@@ -22,7 +27,8 @@ Event& MatchingEngine::new_event(EventType t) noexcept {
     return e;
 }
 
-void MatchingEngine::emit_reject(const Command& cmd, RejectReason r) noexcept {
+template <class Book>
+void BasicMatchingEngine<Book>::emit_reject(const Command& cmd, RejectReason r) noexcept {
     ++stats_.rejects;
     Event& e = new_event(EventType::Rejected);
     e.order_id = cmd.id;
@@ -35,7 +41,8 @@ void MatchingEngine::emit_reject(const Command& cmd, RejectReason r) noexcept {
     e.ts_in = cmd.ts_recv;
 }
 
-void MatchingEngine::emit_book_changed(TsNanos ts_in) noexcept {
+template <class Book>
+void BasicMatchingEngine<Book>::emit_book_changed(TsNanos ts_in) noexcept {
     const Price bid = book_.best_bid();
     const Price ask = book_.best_ask();
     if (bid == last_bid_ && ask == last_ask_) return;
@@ -52,7 +59,8 @@ void MatchingEngine::emit_book_changed(TsNanos ts_in) noexcept {
     e.ask_qty = al ? al->total_qty : 0;
 }
 
-std::span<const Event> MatchingEngine::process(const Command& cmd) noexcept {
+template <class Book>
+std::span<const Event> BasicMatchingEngine<Book>::process(const Command& cmd) noexcept {
     out_.clear();
     cur_ts_out_ = now_ns();
     ++stats_.commands;
@@ -83,7 +91,8 @@ std::span<const Event> MatchingEngine::process(const Command& cmd) noexcept {
     return {out_.data(), out_.size()};
 }
 
-Quantity MatchingEngine::match(Order& in, ClientId client) noexcept {
+template <class Book>
+Quantity BasicMatchingEngine<Book>::match(Order& in, ClientId client) noexcept {
     const Side book_side = opposite(in.side);
     Quantity total_filled = 0;
 
@@ -91,7 +100,7 @@ Quantity MatchingEngine::match(Order& in, ClientId client) noexcept {
         PriceLevel* lvl = book_.best_level(book_side);
         if (lvl == nullptr) break;
         if (in.type != OrderType::Market &&
-            !OrderBook::crosses(in.side, in.price, lvl->price)) {
+            !crosses(in.side, in.price, lvl->price)) {
             break;
         }
 
@@ -182,7 +191,8 @@ Quantity MatchingEngine::match(Order& in, ClientId client) noexcept {
     return total_filled;
 }
 
-void MatchingEngine::handle_new(const Command& cmd) noexcept {
+template <class Book>
+void BasicMatchingEngine<Book>::handle_new(const Command& cmd) noexcept {
     const bool is_market =
         cmd.ord_type == OrderType::Market || cmd.price == kNoPrice;
     const Price limit = is_market ? kNoPrice : cmd.price;
@@ -201,7 +211,7 @@ void MatchingEngine::handle_new(const Command& cmd) noexcept {
     }
     if (cmd.ord_type == OrderType::PostOnly) {
         const PriceLevel* opp = book_.best_level(opposite(cmd.side));
-        if (opp != nullptr && OrderBook::crosses(cmd.side, limit, opp->price)) {
+        if (opp != nullptr && crosses(cmd.side, limit, opp->price)) {
             emit_reject(cmd, RejectReason::PostOnlyWouldCross);
             return;
         }
@@ -274,7 +284,8 @@ void MatchingEngine::handle_new(const Command& cmd) noexcept {
     index_.insert(slot->id, slot);
 }
 
-void MatchingEngine::handle_cancel(const Command& cmd) noexcept {
+template <class Book>
+void BasicMatchingEngine<Book>::handle_cancel(const Command& cmd) noexcept {
     Order* o = index_.find(cmd.id);
     if (o == nullptr) {
         emit_reject(cmd, RejectReason::UnknownOrder);
@@ -294,7 +305,8 @@ void MatchingEngine::handle_cancel(const Command& cmd) noexcept {
     pool_.release(o);
 }
 
-void MatchingEngine::handle_modify(const Command& cmd) noexcept {
+template <class Book>
+void BasicMatchingEngine<Book>::handle_modify(const Command& cmd) noexcept {
     Order* o = index_.find(cmd.id);
     if (o == nullptr) {
         emit_reject(cmd, RejectReason::UnknownOrder);
@@ -341,5 +353,10 @@ void MatchingEngine::handle_modify(const Command& cmd) noexcept {
         Command::make_new(cmd.id, client, side, type, new_price, new_qty, cmd.ts_recv);
     handle_new(repl);
 }
+
+// --- explicit instantiations ---------------------------------------------
+template class BasicMatchingEngine<OrderBook>;
+template class BasicMatchingEngine<MapOrderBook>;
+template class BasicMatchingEngine<SortedVectorOrderBook>;
 
 }  // namespace lob
