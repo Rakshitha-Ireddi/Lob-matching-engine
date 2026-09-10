@@ -17,3 +17,7 @@ compile_commands.json
 .vscode/
 .idea/
 __pycache__/
+
+# local only: LaTeX paper / preprint (not published to GitHub)
+/paper/
+/.github/workflows/paper.yml
