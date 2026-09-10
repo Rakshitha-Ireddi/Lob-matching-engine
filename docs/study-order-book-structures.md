@@ -142,11 +142,22 @@ instrument.
   trustworthy. A tuned Linux host with `isolcpus` would tighten every number
   and lower the tails, but the *relative* ordering is a property of the
   algorithms, not the box.
-- **No hardware performance counters.** The cache-miss explanation above is
-  the textbook mechanism and is consistent with the L-dependence in the data,
-  but it is not directly measured here — `perf stat` needs Linux. This is the
-  first thing to add (`perf stat -e cache-misses,LLC-load-misses,...` per book
-  in CI).
+- **Cache behaviour is measured in CI, not on this box.** The
+  [`order-book study` workflow](../.github/workflows/book-study.yml) re-runs
+  everything on a Linux runner and adds:
+  - `lob_bench --mode book` — a **book-only microbench** that replays the same
+    flow applying *only* `add` / `remove` / `best_bid` / `best_ask` / `snapshot`
+    (no matching, no events), so a cache tool attributes every difference to the
+    data structure. On this Windows box it already shows the isolated gap is
+    larger than the full-engine gap (bitset p50 ~31 ns vs ~60 ns for the
+    baselines at `depth-ticks 48`, where matching work had diluted it to
+    ~5 %).
+  - **cachegrind** (`--cache-sim=yes`) per book — deterministic simulated D1 /
+    LL miss rates, CPU-independent.
+  - **`perf stat`** hardware counters, best-effort (most CI runners block the
+    PMU; the step is `|| true`).
+  Results land in the workflow's **job summary** and as a downloadable
+  `order-book-study` artifact.
 - **Synthetic order flow.** The generator is a reasonable zero-intelligence
   model but not a replay of a real venue. Book width and churn are the levers
   that matter for this comparison and both are swept, but a real ITCH replay
@@ -157,6 +168,8 @@ instrument.
 
 ## Reproduce
 
+Locally:
+
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build
 ctest --test-dir build -R BookEquivalence        # all three books agree
@@ -166,8 +179,14 @@ for D in 16 48 200 800; do
       --depth-ticks $D --compare --json bench-out/compare_dt$D.json
   sleep 15   # let the CPU cool between runs
 done
+./build/lob_bench --mode book --events 5000000 --seed 1 --depth-ticks 48 --compare  # data structure only
 python tools/plot_results.py        # -> docs/images/book_comparison.png
 ```
+
+On a clean Linux runner with cache instrumentation: **Actions → "order-book
+study" → Run workflow**. The job summary carries the native sweep, the
+book-only microbench and the cachegrind table; the full outputs download as
+the `order-book-study` artifact.
 
 Book implementations: [`order_book.hpp`](../include/lob/order_book.hpp) (bitset),
 [`map_order_book.hpp`](../include/lob/map_order_book.hpp),

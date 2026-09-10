@@ -1,0 +1,121 @@
+name: order-book study
+
+# Reproduces docs/study-order-book-structures.md on a Linux runner and adds the
+# cache-behaviour evidence the Windows dev box cannot produce (cachegrind, and
+# perf hardware counters where the runner exposes them).
+#
+# Runs on demand (Actions tab -> "order-book study" -> Run workflow) and when
+# the books, the engine or the study change.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "include/lob/*order_book*.hpp"
+      - "include/lob/matching_engine.hpp"
+      - "src/matching_engine.cpp"
+      - "apps/bench/main.cpp"
+      - "docs/study-order-book-structures.md"
+      - ".github/workflows/book-study.yml"
+
+jobs:
+  study:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y ninja-build valgrind linux-tools-common linux-tools-generic || \
+            sudo apt-get install -y ninja-build valgrind
+
+      - name: Build (Release)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLOB_BUILD_TESTS=OFF
+          cmake --build build
+
+      - name: Equivalence (all three books agree)
+        run: |
+          cmake -S . -B build-t -G Ninja -DCMAKE_BUILD_TYPE=Release -DLOB_BUILD_APPS=OFF
+          cmake --build build-t --target lob_tests
+          ctest --test-dir build-t -R BookEquivalence --output-on-failure
+
+      - name: Native comparison sweep (full engine)
+        run: |
+          mkdir -p study
+          for D in 16 48 200 800; do
+            ./build/lob_bench --mode core --events 10000000 --seed 1 \
+              --depth-ticks $D --compare --json study/compare_dt$D.json | tee study/compare_dt$D.txt
+          done
+          ./build/lob_bench --mode core --events 10000000 --seed 1 --depth-ticks 120 \
+            --p-new 0.44 --p-cancel 0.5 --compare --json study/compare_churn.json | tee study/compare_churn.txt
+
+      - name: Book-only microbench
+        run: |
+          ./build/lob_bench --mode book --events 5000000 --seed 1 --depth-ticks 48 \
+            --compare --json study/book_micro_dt48.json | tee study/book_micro_dt48.txt
+          ./build/lob_bench --mode book --events 5000000 --seed 1 --depth-ticks 400 \
+            --compare --json study/book_micro_dt400.json | tee study/book_micro_dt400.txt
+
+      - name: Cachegrind (simulated D1 / LL cache behaviour, per book)
+        run: |
+          echo "| book | D refs | D1 miss rate | LLd miss rate | I refs | I1 miss rate |" >  study/cachegrind.md
+          echo "|------|-------:|-------------:|--------------:|-------:|-------------:|" >> study/cachegrind.md
+          for B in bitset map flat; do
+            valgrind --tool=cachegrind --cache-sim=yes --branch-sim=no \
+              --cachegrind-out-file=study/cg-$B.out \
+              ./build/lob_bench --mode book --book $B --events 400000 --warmup 0 --depth-ticks 200 \
+              2> study/cg-$B.log || true
+            drefs=$(grep -oP 'D\s+refs:\s+\K[\d,]+'      study/cg-$B.log | head -1)
+            d1r=$(grep -oP 'D1\s+miss rate:\s+\K[\d.]+%' study/cg-$B.log | head -1)
+            lldr=$(grep -oP 'LLd\s+miss rate:\s+\K[\d.]+%' study/cg-$B.log | head -1)
+            irefs=$(grep -oP 'I\s+refs:\s+\K[\d,]+'      study/cg-$B.log | head -1)
+            i1r=$(grep -oP 'I1\s+miss rate:\s+\K[\d.]+%' study/cg-$B.log | head -1)
+            echo "| $B | ${drefs:-?} | ${d1r:-?} | ${lldr:-?} | ${irefs:-?} | ${i1r:-?} |" >> study/cachegrind.md
+          done
+          cat study/cachegrind.md
+
+      - name: perf hardware counters (best effort -- many CI runners block the PMU)
+        run: |
+          echo "perf_event_paranoid = $(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo n/a)"
+          for B in bitset map flat; do
+            echo "### $B" | tee -a study/perf.txt
+            perf stat -e task-clock,instructions,cycles,cache-references,cache-misses,LLC-load-misses \
+              ./build/lob_bench --mode book --book $B --events 3000000 --warmup 0 --depth-ticks 200 \
+              2>> study/perf.txt || echo "(perf unavailable on this runner)" | tee -a study/perf.txt
+          done
+          cat study/perf.txt || true
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Order-book data-structure study (Linux runner)"
+            echo
+            echo "\`$(uname -srm)\` · \`$(lscpu | grep 'Model name' | sed 's/.*: *//')\`"
+            echo
+            echo "### Native comparison (full engine, 10M commands)"
+            echo '```'
+            for D in 16 48 200 800; do
+              echo "depth-ticks $D:"; sed -n '/^book /,/^flat /p' study/compare_dt$D.txt; echo
+            done
+            echo "churn (50% cancels):"; sed -n '/^book /,/^flat /p' study/compare_churn.txt
+            echo '```'
+            echo
+            echo "### Book-only microbench (no matching, 5M ops)"
+            echo '```'
+            echo "depth-ticks 48:";  sed -n '/^book /,/^flat /p' study/book_micro_dt48.txt; echo
+            echo "depth-ticks 400:"; sed -n '/^book /,/^flat /p' study/book_micro_dt400.txt
+            echo '```'
+            echo
+            echo "### Cachegrind (depth-ticks 200, 400k book ops)"
+            cat study/cachegrind.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload study artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: order-book-study
+          path: study/
