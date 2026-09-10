@@ -1,0 +1,16 @@
+{
+  "mode": "load", "arrivals": "poisson",
+  "cpu": "11th Gen Intel(R) Core(TM) i3-1125G4 @ 2.00GHz", "host": "Windows", "depth_ticks": 48,
+  "points": [
+    { "offered_ops": 500000, "achieved_ops": 500393, "sustained": true, "p50_ns": 370, "p99_ns": 23679, "p999_ns": 304127, "p9999_ns": 1095679, "max_ns": 1352987, "mean_ns": 1936.5 },
+    { "offered_ops": 1000000, "achieved_ops": 1001037, "sustained": true, "p50_ns": 402, "p99_ns": 12175, "p999_ns": 307967, "p9999_ns": 477695, "max_ns": 556819, "mean_ns": 1705.1 },
+    { "offered_ops": 1500000, "achieved_ops": 1501930, "sustained": true, "p50_ns": 470, "p99_ns": 130751, "p999_ns": 863743, "p9999_ns": 951807, "max_ns": 966304, "mean_ns": 5912.0 },
+    { "offered_ops": 2000000, "achieved_ops": 2003067, "sustained": true, "p50_ns": 571, "p99_ns": 48511, "p999_ns": 489983, "p9999_ns": 601599, "max_ns": 607632, "mean_ns": 3769.5 },
+    { "offered_ops": 2250000, "achieved_ops": 2244263, "sustained": true, "p50_ns": 1439, "p99_ns": 7258111, "p999_ns": 7671807, "p9999_ns": 7684095, "max_ns": 7687355, "mean_ns": 912445.9 },
+    { "offered_ops": 2500000, "achieved_ops": 2504470, "sustained": true, "p50_ns": 2727, "p99_ns": 7319551, "p999_ns": 7897087, "p9999_ns": 7917567, "max_ns": 7921555, "mean_ns": 975918.4 },
+    { "offered_ops": 2750000, "achieved_ops": 2721664, "sustained": true, "p50_ns": 24111, "p99_ns": 9568255, "p999_ns": 9658367, "p9999_ns": 9691135, "max_ns": 9695820, "mean_ns": 1635164.3 },
+    { "offered_ops": 3000000, "achieved_ops": 2994962, "sustained": true, "p50_ns": 1651711, "p99_ns": 6430719, "p999_ns": 6602751, "p9999_ns": 6631423, "max_ns": 6643222, "mean_ns": 2162239.1 },
+    { "offered_ops": 3500000, "achieved_ops": 2948779, "sustained": true, "p50_ns": 58032127, "p99_ns": 105775103, "p999_ns": 107937791, "p9999_ns": 108134399, "max_ns": 108126213, "mean_ns": 56991868.3 }
+  ]
+}
+

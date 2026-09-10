@@ -13,8 +13,10 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <span>
 #include <string>
 #include <thread>
@@ -226,6 +228,168 @@ CoreRun measure_book(const char* name, const lob::EngineConfig& ec,
     return run;
 }
 
+// --- open-loop response-time model -------------------------------------------
+//
+// The `core` bench is closed-loop: it never issues the next command until the
+// current one returns, so it measures *service time* and cannot observe
+// queueing. `load` mode issues commands on a fixed wall-clock schedule at a
+// target rate; each command's response time is measured from its *scheduled*
+// arrival (not from when the engine got to it), so a backlog shows up as
+// growing response time -- the classic coordinated-omission-free measurement.
+struct LoadPoint {
+    double offered_ops = 0;
+    double achieved_ops = 0;
+    std::uint64_t recorded = 0;
+    std::uint64_t p50 = 0, p99 = 0, p999 = 0, p9999 = 0, max = 0;
+    double mean = 0;
+    bool sustained = true;   // engine kept up with the schedule
+};
+
+template <class Book>
+LoadPoint measure_load(const lob::EngineConfig& ec, const lob::FlowConfig& fc,
+                       double target_ops, std::uint64_t events, std::uint64_t warmup,
+                       bool poisson, std::uint64_t seed) {
+    lob::BasicMatchingEngine<Book> engine(ec);
+    lob::OrderFlowGenerator gen(fc);
+
+    std::vector<lob::Command> cmds(events);
+    for (auto& c : cmds) c = gen.next();
+
+    // warm-up: fill the book, untimed, off-schedule
+    for (std::uint64_t i = 0; i < warmup && i < events; ++i) engine.process(cmds[i]);
+
+    LatencyHistogram hist{2'000'000'000ULL, 3};
+    const double gap_ns = 1e9 / target_ops;
+    std::uint64_t rng = seed * 0x9e3779b97f4a7c15ULL + 1;
+    const auto next_u = [&] {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        return (static_cast<double>(rng >> 11) + 1.0) * (1.0 / 9007199254740992.0);
+    };
+
+    const lob::TsNanos base = lob::now_ns();
+    lob::TsNanos sched = base;
+    std::uint64_t checksum = 0;
+    lob::TsNanos last_done = base;
+
+    for (std::uint64_t i = warmup; i < events; ++i) {
+        sched += static_cast<lob::TsNanos>(poisson ? -std::log(next_u()) * gap_ns : gap_ns);
+        lob::TsNanos t;
+        while ((t = lob::now_ns()) < sched) { /* busy-wait to the schedule */
+        }
+        const std::span<const lob::Event> evs = engine.process(cmds[i]);
+        last_done = lob::now_ns();
+        hist.record(last_done - sched);
+        for (const auto& e : evs) checksum += e.price + e.quantity;
+    }
+    g_checksum_sink = checksum;
+
+    const std::uint64_t n = events - warmup;
+    LoadPoint lp;
+    lp.offered_ops = target_ops;
+    lp.achieved_ops = static_cast<double>(n) * 1e9 / static_cast<double>(last_done - base);
+    lp.recorded = hist.count();
+    lp.p50 = hist.percentile(50);
+    lp.p99 = hist.percentile(99);
+    lp.p999 = hist.percentile(99.9);
+    lp.p9999 = hist.percentile(99.99);
+    lp.max = hist.max();
+    lp.mean = hist.mean();
+    // "sustained" = wall time within 20% of the ideal schedule
+    lp.sustained = static_cast<double>(last_done - base) <
+                   1.20 * static_cast<double>(n) * gap_ns;
+    return lp;
+}
+
+int run_load(const Args& args) {
+    const std::uint64_t events = args.u64("events", 3'000'000);
+    const std::uint64_t warmup =
+        args.u64("warmup", std::min<std::uint64_t>(events / 5, 500'000));
+    const lob::Price band_min = args.i64("band-min", 1);
+    const lob::Price band_max = args.i64("band-max", 200'000);
+    const bool poisson = !args.flag("uniform");
+    const std::uint64_t seed = args.u64("seed", 42);
+
+    lob::EngineConfig ec;
+    ec.min_price = band_min;
+    ec.max_price = band_max;
+    ec.max_orders = static_cast<std::size_t>(args.u64("pool", 4'000'000));
+
+    lob::FlowConfig fc;
+    fc.seed = seed;
+    fc.ref_price = (band_min + band_max) / 2;
+    fc.min_price = band_min;
+    fc.max_price = band_max;
+    fc.depth_ticks = static_cast<int>(args.i64("depth-ticks", 48));
+    fc.clients = static_cast<lob::ClientId>(args.u64("clients", 8));
+
+    std::string pin_detail = "not pinned";
+    if (args.flag("pin"))
+        pin_detail = lob::pin_this_thread(static_cast<int>(args.i64("cpu", 2))).detail;
+
+    std::vector<double> rates;
+    const std::string sweep = args.str("rate-sweep", "");
+    if (!sweep.empty()) {
+        std::size_t p = 0;
+        while (p < sweep.size()) {
+            std::size_t q = sweep.find(',', p);
+            if (q == std::string::npos) q = sweep.size();
+            rates.push_back(std::strtod(sweep.substr(p, q - p).c_str(), nullptr) * 1e6);
+            p = q + 1;
+        }
+    } else {
+        rates.push_back(args.f64("rate", 1'000'000.0));
+    }
+
+    std::printf("lob_bench / load  (open-loop response time)\n");
+    std::printf("  host      : %s / %s\n", cpu_brand().c_str(), os_name().c_str());
+    std::printf("  arrivals  : %s\n", poisson ? "Poisson" : "uniform");
+    std::printf("  events    : %llu (warmup %llu), band [%lld,%lld], depth-ticks %d\n",
+                (unsigned long long)events, (unsigned long long)warmup,
+                (long long)band_min, (long long)band_max, fc.depth_ticks);
+    std::printf("  scheduling: %s\n\n", pin_detail.c_str());
+
+    std::printf("%10s %12s %6s %10s %10s %10s %10s\n", "offered", "achieved", "keep?",
+                "p50", "p99", "p99.9", "max");
+    std::vector<LoadPoint> pts;
+    for (double r : rates) {
+        LoadPoint lp = measure_load<lob::OrderBook>(ec, fc, r, events, warmup, poisson, seed);
+        pts.push_back(lp);
+        std::printf("%9.2fM %11.2fM %6s %9.2fus %9.2fus %9.2fus %9.2fus\n", r / 1e6,
+                    lp.achieved_ops / 1e6, lp.sustained ? "yes" : "NO",
+                    lp.p50 / 1e3, lp.p99 / 1e3, lp.p999 / 1e3, lp.max / 1e3);
+    }
+
+    const std::string js = args.str("json", "");
+    if (!js.empty()) {
+        std::string doc = "{\n  \"mode\": \"load\", \"arrivals\": \"" +
+                          std::string(poisson ? "poisson" : "uniform") +
+                          "\",\n  \"cpu\": \"" + cpu_brand() + "\", \"host\": \"" +
+                          os_name() + "\", \"depth_ticks\": " +
+                          std::to_string(fc.depth_ticks) + ",\n  \"points\": [\n";
+        for (std::size_t i = 0; i < pts.size(); ++i) {
+            const auto& p = pts[i];
+            char buf[512];
+            std::snprintf(buf, sizeof(buf),
+                          "    { \"offered_ops\": %.0f, \"achieved_ops\": %.0f, "
+                          "\"sustained\": %s, \"p50_ns\": %llu, \"p99_ns\": %llu, "
+                          "\"p999_ns\": %llu, \"p9999_ns\": %llu, \"max_ns\": %llu, "
+                          "\"mean_ns\": %.1f }%s\n",
+                          p.offered_ops, p.achieved_ops, p.sustained ? "true" : "false",
+                          (unsigned long long)p.p50, (unsigned long long)p.p99,
+                          (unsigned long long)p.p999, (unsigned long long)p.p9999,
+                          (unsigned long long)p.max, p.mean,
+                          i + 1 < pts.size() ? "," : "");
+            doc += buf;
+        }
+        doc += "  ]\n}\n";
+        lob::write_json_file(js, doc);
+        std::printf("\nwrote %s\n", js.c_str());
+    }
+    return 0;
+}
+
 #ifdef LOB_HAS_LIQUIBOOK
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wnon-virtual-dtor"
@@ -357,6 +521,9 @@ CoreRun dispatch_core(const std::string& book, bool book_only,
     if (book_only) {
         if (book == "map")
             return measure_book<lob::MapOrderBook>("map", ec, fc, events, warmup, tsc, ov);
+        if (book == "map-pooled")
+            return measure_book<lob::PooledMapOrderBook>("map-pooled", ec, fc, events,
+                                                         warmup, tsc, ov);
         if (book == "flat" || book == "vector" || book == "sorted-vector")
             return measure_book<lob::SortedVectorOrderBook>("flat", ec, fc, events, warmup,
                                                             tsc, ov);
@@ -364,6 +531,9 @@ CoreRun dispatch_core(const std::string& book, bool book_only,
     }
     if (book == "map")
         return measure_core<lob::MapOrderBook>("map", ec, fc, events, warmup, tsc, ov);
+    if (book == "map-pooled")
+        return measure_core<lob::PooledMapOrderBook>("map-pooled", ec, fc, events, warmup,
+                                                     tsc, ov);
     if (book == "flat" || book == "vector" || book == "sorted-vector")
         return measure_core<lob::SortedVectorOrderBook>("flat", ec, fc, events, warmup,
                                                         tsc, ov);
@@ -572,8 +742,11 @@ int run_core(const Args& args, bool book_only) {
     if (args.flag("compare")) {
         std::printf("\ncomparing order-book data structures (identical flow, %llu events)\n",
                     static_cast<unsigned long long>(events));
+        const bool with_pooled = args.flag("with-pooled-map");
+        std::vector<const char*> books = {"bitset", "map", "flat"};
+        if (with_pooled) books.insert(books.begin() + 2, "map-pooled");
         std::vector<CoreRun> runs;
-        for (const char* b : {"bitset", "map", "flat"}) {
+        for (const char* b : books) {
             std::fflush(stdout);
             runs.push_back(dispatch_core(b, book_only, ecfg, fcfg, events, warmup, tsc, ov));
             report_core(runs.back(), book_only);
@@ -582,11 +755,11 @@ int run_core(const Args& args, bool book_only) {
         const double base_tput =
             static_cast<double>(runs[0].events) / runs[0].engine_wall_s;
         std::printf(
-            "\n%-8s %12s %10s %9s %9s %9s %9s %8s\n", "book", "cmd/s", "ns/cmd",
+            "\n%-11s %12s %10s %9s %9s %9s %9s %8s\n", "book", "cmd/s", "ns/cmd",
             "p50", "p90", "p99", "p99.9", "vs bit");
         for (const auto& r : runs) {
             const double tput = static_cast<double>(r.events) / r.engine_wall_s;
-            std::printf("%-8s %12.0f %10.1f %9llu %9llu %9llu %9llu %7.2fx\n",
+            std::printf("%-11s %12.0f %10.1f %9llu %9llu %9llu %9llu %7.2fx\n",
                         r.book.c_str(), tput,
                         r.engine_wall_s * 1e9 / static_cast<double>(r.events),
                         (unsigned long long)r.hist.percentile(50),
@@ -796,13 +969,16 @@ int main(int argc, char** argv) {
             "        --band-max P --mid P --pool N --clients N --p-new f --p-cancel f\n"
             "        --p-market f --p-aggressive f --depth-ticks N --pin --cpu N\n"
             "        --json file --csv file --no-book-events\n"
-            "        --book bitset|map|flat      pick the order-book data structure\n"
-            "        --compare                   run all three books on identical flow\n"
+            "        --book bitset|map|map-pooled|flat   pick the order-book structure\n"
+            "        --compare [--with-pooled-map]       run the books on identical flow\n"
             "  book: order-book operations only, no matching -- for cachegrind / perf.\n"
             "        same options; --book / --compare apply.\n"
+            "  load: open-loop response time. --rate R (ops/s) or --rate-sweep a,b,c (M/s)\n"
+            "        --uniform (default Poisson) --events N --depth-ticks N --pin --json file\n"
             "  e2e : --events N --port P --md-port P --seed S --json file\n");
         return 0;
     }
     if (mode == "e2e") return run_e2e(args);
+    if (mode == "load") return run_load(args);
     return run_core(args, mode == "book");
 }
