@@ -259,6 +259,45 @@ def plot_book_platforms(win_files, lin_files, outdir):
     plt.close(fig)
 
 
+def plot_engine_vs_liquibook(files, outdir):
+    """files: list of (depth, path) for --engine-compare json docs."""
+    if not files:
+        return
+    files.sort()
+    depths = [d for d, _ in files]
+    mine_t, lb_t, mine_p, lb_p = [], [], [], []
+    for _, path in files:
+        runs = {r["mode"].split("/")[-1].replace("this", "bitset"): r
+                for r in json.load(open(path))["runs"]}
+        m = next(r for k, r in runs.items() if "liquibook" not in k)
+        l = runs.get("liquibook")
+        mine_t.append(m["throughput_ops"] / 1e6)
+        lb_t.append(l["throughput_ops"] / 1e6)
+        mine_p.append(m["latency_ns"]["p999"])
+        lb_p.append(l["latency_ns"]["p999"])
+
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 4.2))
+    a1.plot(depths, mine_t, "o-", color=ACCENT, linewidth=2, label="this engine (bitset book)")
+    a1.plot(depths, lb_t, "s--", color="#8a5a2b", linewidth=2, label="OCI liquibook")
+    a1.set_xscale("log"); a1.set_ylim(bottom=0)
+    a1.set_xlabel("price scatter (ticks from mid)"); a1.set_ylabel("throughput (M cmd/s)")
+    a1.set_title("Engine throughput  ·  identical NEW+CANCEL stream, verified same trades")
+    a1.legend(frameon=False)
+
+    a2.plot(depths, mine_p, "o-", color=ACCENT, linewidth=2, label="this engine")
+    a2.plot(depths, lb_p, "s--", color="#8a5a2b", linewidth=2, label="OCI liquibook")
+    a2.set_xscale("log"); a2.set_yscale("log")
+    a2.set_yticks([1000, 2000, 5000, 10000, 20000])
+    a2.yaxis.set_major_formatter(mticker.FuncFormatter(fmt_ns))
+    a2.yaxis.set_minor_formatter(mticker.NullFormatter())
+    a2.set_xlabel("price scatter (ticks from mid)"); a2.set_ylabel("p99.9 latency")
+    a2.set_title("Engine tail latency")
+    a2.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, "engine_vs_liquibook.png"), dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bench", default="bench-out/core.json")
@@ -296,6 +335,13 @@ def main():
     cmp_files = _cmp_list(a.compare_glob)
     plot_book_comparison(cmp_files, a.outdir)
     plot_book_platforms(cmp_files, _cmp_list("bench-out/linux-ci/compare_dt*.json"), a.outdir)
+
+    eng = []
+    for p in glob.glob("bench-out/engine_dt*.json"):
+        m = re.search(r"engine_dt(\d+)", os.path.basename(p))
+        if m:
+            eng.append((int(m.group(1)), p))
+    plot_engine_vs_liquibook(eng, a.outdir)
 
     print(f"wrote charts to {a.outdir}/")
 

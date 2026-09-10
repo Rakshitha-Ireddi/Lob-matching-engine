@@ -34,6 +34,11 @@
 #include "lob/wire.hpp"
 #include "lob/net.hpp"
 
+#ifdef LOB_HAS_LIQUIBOOK
+    #include <book/order.h>
+    #include <book/order_book.h>
+#endif
+
 namespace {
 
 using lob::LatencyHistogram;
@@ -72,7 +77,7 @@ template <class Book>
 CoreRun measure_core(const char* name, const lob::EngineConfig& ecfg,
                      const lob::FlowConfig& fcfg, std::uint64_t events,
                      std::uint64_t warmup, const lob::TscClock& tsc,
-                     std::uint64_t ov) {
+                     std::uint64_t ov, std::uint64_t* trade_hash = nullptr) {
     lob::BasicMatchingEngine<Book> engine(ecfg);
     lob::OrderFlowGenerator gen(fcfg);
 
@@ -100,8 +105,19 @@ CoreRun measure_core(const char* name, const lob::EngineConfig& ecfg,
                 const std::uint64_t d = (c1 - c0 > ov) ? (c1 - c0 - ov) : 0;
                 run.hist.record(tsc.to_nanos(d));
             }
-            for (const auto& e : evs)
+            for (const auto& e : evs) {
                 checksum += e.price + e.quantity + static_cast<std::uint64_t>(e.type);
+                if (trade_hash && e.type == lob::EventType::Trade) {
+                    std::uint64_t h = *trade_hash;
+                    for (std::uint64_t v :
+                         {static_cast<std::uint64_t>(e.price), e.quantity,
+                          static_cast<std::uint64_t>(e.side == lob::Side::Buy ? 1 : 2)}) {
+                        h ^= v;
+                        h *= 1099511628211ULL;
+                    }
+                    *trade_hash = h;
+                }
+            }
         }
         run.engine_wall_s +=
             std::chrono::duration<double>(std::chrono::steady_clock::now() - cw0).count();
@@ -209,6 +225,130 @@ CoreRun measure_book(const char* name, const lob::EngineConfig& ec,
     g_checksum_sink = sink;
     return run;
 }
+
+#ifdef LOB_HAS_LIQUIBOOK
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnon-virtual-dtor"
+// Order type liquibook's OrderBook template needs. `remaining` is maintained
+// from the fill callback so finished orders can be recycled to the arena.
+struct LbOrder : public liquibook::book::Order {
+    bool          buy = false;
+    std::uint32_t id  = 0;
+    liquibook::book::Price    px  = 0;
+    liquibook::book::Quantity qty = 0;
+    std::int64_t              remaining = 0;
+    bool is_buy() const override { return buy; }
+    liquibook::book::Price price() const override { return px; }
+    liquibook::book::Quantity order_qty() const override { return qty; }
+};
+
+struct LbListener : public liquibook::book::OrderListener<LbOrder*> {
+    std::uint64_t accepts = 0, rejects = 0, fills = 0, cancels = 0, shares = 0;
+    std::vector<LbOrder*>* freelist = nullptr;
+    std::vector<LbOrder*>* by_id = nullptr;
+    std::uint64_t* trade_hash = nullptr;
+
+    void retire(LbOrder* o) {
+        if (o->id < by_id->size() && (*by_id)[o->id] == o) (*by_id)[o->id] = nullptr;
+        freelist->push_back(o);
+    }
+    void on_accept(LbOrder* const&) override { ++accepts; }
+    void on_reject(LbOrder* const&, const char*) override { ++rejects; }
+    void on_fill(LbOrder* const& o, LbOrder* const& m, liquibook::book::Quantity q,
+                 liquibook::book::Price price) override {
+        ++fills;
+        shares += q;
+        if (trade_hash) {
+            std::uint64_t h = *trade_hash;
+            for (std::uint64_t v : {static_cast<std::uint64_t>(price), q,
+                                    static_cast<std::uint64_t>(o->buy ? 1 : 2)}) {
+                h ^= v;
+                h *= 1099511628211ULL;
+            }
+            *trade_hash = h;
+        }
+        if ((o->remaining -= static_cast<std::int64_t>(q)) <= 0) retire(o);
+        if ((m->remaining -= static_cast<std::int64_t>(q)) <= 0) retire(m);
+    }
+    void on_cancel(LbOrder* const& o) override {
+        ++cancels;
+        retire(o);
+    }
+    void on_cancel_reject(LbOrder* const&, const char*) override {}
+    void on_replace(LbOrder* const&, const std::int64_t&, liquibook::book::Price) override {}
+    void on_replace_reject(LbOrder* const&, const char*) override {}
+    void on_trigger_stop(LbOrder* const&) override {}
+};
+
+// Replay the NEW + CANCEL subset of the flow through liquibook's per-order
+// multimap book. Market orders and modifies are skipped (see the study doc),
+// so pair this with a flow that has p_market = 0 and p_new + p_cancel = 1.
+CoreRun measure_liquibook(const lob::EngineConfig& ec, const lob::FlowConfig& fc,
+                          std::uint64_t events, std::uint64_t warmup,
+                          const lob::TscClock& tsc, std::uint64_t ov,
+                          std::uint64_t* trade_hash = nullptr) {
+    liquibook::book::OrderBook<LbOrder*> book("BENCH");
+    lob::OrderFlowGenerator gen(fc);
+
+    CoreRun run;
+    run.book = "liquibook";
+    run.events = events;
+
+    std::vector<LbOrder> arena(ec.max_orders);
+    std::vector<LbOrder*> freelist;
+    freelist.reserve(ec.max_orders);
+    for (std::size_t i = arena.size(); i-- > 0;) freelist.push_back(&arena[i]);
+    std::vector<LbOrder*> by_id;
+
+    LbListener lst;
+    lst.freelist = &freelist;
+    lst.by_id = &by_id;
+    lst.trade_hash = trade_hash;
+    book.set_order_listener(&lst);
+
+    std::uint64_t sink = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (std::uint64_t i = 0; i < events; ++i) {
+        const lob::Command c = gen.next();
+        const std::uint64_t c0 = lob::TscClock::raw();
+
+        if (c.type == lob::CommandType::New && c.price != lob::kNoPrice &&
+            c.price > 0 && !freelist.empty()) {
+            LbOrder* o = freelist.back();
+            freelist.pop_back();
+            o->buy = (c.side == lob::Side::Buy);
+            o->id = static_cast<std::uint32_t>(c.id);
+            o->px = static_cast<liquibook::book::Price>(c.price);
+            o->qty = static_cast<liquibook::book::Quantity>(c.quantity ? c.quantity : 1);
+            o->remaining = static_cast<std::int64_t>(o->qty);
+            if (c.id >= by_id.size()) by_id.resize(c.id + 1, nullptr);
+            by_id[c.id] = o;
+            book.add(o, 0);
+        } else if (c.type == lob::CommandType::Cancel && c.id < by_id.size() &&
+                   by_id[c.id] != nullptr) {
+            book.cancel(by_id[c.id]);
+        }
+
+        sink ^= book.bids().empty() ? 0 : book.bids().begin()->first.price();
+        sink ^= book.asks().empty() ? 0 : (book.asks().begin()->first.price() << 1);
+
+        const std::uint64_t c1 = lob::TscClock::raw();
+        if (i >= warmup) {
+            const std::uint64_t d = (c1 - c0 > ov) ? (c1 - c0 - ov) : 0;
+            run.hist.record(tsc.to_nanos(d));
+        }
+    }
+    run.engine_wall_s = run.total_wall_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    run.stats.trades = lst.fills;
+    run.stats.shares_traded = lst.shares;
+    run.stats.new_orders = lst.accepts;
+    run.resting_now = book.bids().size() + book.asks().size();
+    g_checksum_sink = sink;
+    return run;
+}
+#pragma GCC diagnostic pop
+#endif  // LOB_HAS_LIQUIBOOK
 
 CoreRun dispatch_core(const std::string& book, bool book_only,
                       const lob::EngineConfig& ec, const lob::FlowConfig& fc,
@@ -360,6 +500,74 @@ int run_core(const Args& args, bool book_only) {
     std::fflush(stdout);
 
     const std::string js = args.str("json", "");
+
+#ifdef LOB_HAS_LIQUIBOOK
+    if (args.flag("engine-compare")) {
+        // engine vs engine on an identical NEW+CANCEL stream (no market / modify,
+        // which liquibook's replay path here does not cover).
+        lob::FlowConfig ef = fcfg;
+        ef.p_market = 0.0;
+        ef.p_new = 0.60;
+        ef.p_cancel = 0.40;
+        std::printf("\nengine vs engine: this bitset book vs OCI liquibook "
+                    "(NEW+CANCEL stream, %llu events)\n",
+                    static_cast<unsigned long long>(events));
+
+        // parity: same trade stream (price, qty, aggressor side) from both engines
+        {
+            std::uint64_t h_mine = 1469598103934665603ULL, h_lb = 1469598103934665603ULL;
+            const std::uint64_t vn = std::min<std::uint64_t>(events, 300'000);
+            (void)measure_core<lob::OrderBook>("verify", ecfg, ef, vn, 0, tsc, ov, &h_mine);
+            (void)measure_liquibook(ecfg, ef, vn, 0, tsc, ov, &h_lb);
+            std::printf("  trade-stream parity over %llu events: %s (0x%llx)\n",
+                        (unsigned long long)vn,
+                        h_mine == h_lb ? "MATCH" : "MISMATCH",
+                        (unsigned long long)h_mine);
+        }
+
+        CoreRun mine =
+            measure_core<lob::OrderBook>("this/bitset", ecfg, ef, events, warmup, tsc, ov);
+        report_core(mine, false);
+        CoreRun lb = measure_liquibook(ecfg, ef, events, warmup, tsc, ov);
+        report_core(lb, false);
+
+        const double bt = static_cast<double>(mine.events) / mine.engine_wall_s;
+        std::printf("\n%-14s %12s %10s %9s %9s %9s %8s\n", "engine", "cmd/s", "ns/cmd",
+                    "p50", "p99", "p99.9", "vs this");
+        for (const auto& r : {mine, lb}) {
+            const double t = static_cast<double>(r.events) / r.engine_wall_s;
+            std::printf("%-14s %12.0f %10.1f %9llu %9llu %9llu %7.2fx\n", r.book.c_str(), t,
+                        r.engine_wall_s * 1e9 / static_cast<double>(r.events),
+                        (unsigned long long)r.hist.percentile(50),
+                        (unsigned long long)r.hist.percentile(99),
+                        (unsigned long long)r.hist.percentile(99.9), bt / t);
+        }
+        std::printf("\ntrades: this %llu, liquibook %llu\n",
+                    (unsigned long long)mine.stats.trades,
+                    (unsigned long long)lb.stats.trades);
+
+        if (!js.empty()) {
+            std::string doc = "{\n  \"mode\": \"engine-compare\",\n  \"events\": " +
+                              std::to_string(events) + ",\n  \"cpu\": \"" + cpu_brand() +
+                              "\",\n  \"host\": \"" + os_name() + "\",\n  \"runs\": [\n    " +
+                              lob::to_json(to_bench_result(mine)) + ",\n    " +
+                              lob::to_json(to_bench_result(lb)) + "\n  ]\n}\n";
+            lob::write_json_file(js, doc);
+            std::printf("wrote %s\n", js.c_str());
+        }
+        return 0;
+    }
+    if (args.str("engine", "mine") == "liquibook") {
+        lob::FlowConfig ef = fcfg;
+        ef.p_market = 0.0;
+        ef.p_new = 0.60;
+        ef.p_cancel = 0.40;
+        const CoreRun lb = measure_liquibook(ecfg, ef, events, warmup, tsc, ov);
+        report_core(lb, false);
+        if (!js.empty()) lob::write_json_file(js, lob::to_json(to_bench_result(lb)));
+        return 0;
+    }
+#endif
 
     if (args.flag("compare")) {
         std::printf("\ncomparing order-book data structures (identical flow, %llu events)\n",

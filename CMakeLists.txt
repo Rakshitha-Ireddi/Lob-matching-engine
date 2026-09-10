@@ -77,6 +77,20 @@ if(LOB_BUILD_APPS)
 
   add_executable(lob_bench apps/bench/main.cpp)
   target_link_libraries(lob_bench PRIVATE lob_core)
+
+  # Optional third-party comparison target: OCI liquibook (header-only book/).
+  # docs/study-order-book-structures.md compares the engine against it.
+  option(LOB_WITH_LIQUIBOOK "Fetch OCI liquibook as a benchmark comparison target" ON)
+  if(LOB_WITH_LIQUIBOOK)
+    include(FetchContent)
+    FetchContent_Declare(liquibook
+      GIT_REPOSITORY https://github.com/objectcomputing/liquibook.git
+      GIT_TAG        2427613b32f1667abae68a01df6af9ba8270f8e7
+      GIT_SHALLOW    TRUE)
+    FetchContent_MakeAvailable(liquibook)
+    target_include_directories(lob_bench SYSTEM PRIVATE ${liquibook_SOURCE_DIR}/src)
+    target_compile_definitions(lob_bench PRIVATE LOB_HAS_LIQUIBOOK LIQUIBOOK_HAS_DLL=0)
+  endif()
 endif()
 
 # --- tests -------------------------------------------------------------

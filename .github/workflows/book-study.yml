@@ -58,6 +58,13 @@ jobs:
           ./build/lob_bench --mode book --events 5000000 --seed 1 --depth-ticks 400 \
             --compare --json study/book_micro_dt400.json | tee study/book_micro_dt400.txt
 
+      - name: This engine vs OCI liquibook
+        run: |
+          for D in 24 96 400; do
+            ./build/lob_bench --mode core --events 8000000 --seed 1 --depth-ticks $D \
+              --engine-compare --json study/engine_dt$D.json | tee study/engine_dt$D.txt
+          done
+
       - name: Cachegrind (simulated D1 / LL cache behaviour, per book)
         run: |
           echo "| book | D refs | D1 miss rate | LLd miss rate | I refs | I1 miss rate |" >  study/cachegrind.md
@@ -107,6 +114,14 @@ jobs:
             echo '```'
             echo "depth-ticks 48:";  sed -n '/^book /,/^flat /p' study/book_micro_dt48.txt; echo
             echo "depth-ticks 400:"; sed -n '/^book /,/^flat /p' study/book_micro_dt400.txt
+            echo '```'
+            echo
+            echo "### This engine vs OCI liquibook (8M NEW+CANCEL, verified same trades)"
+            echo '```'
+            for D in 24 96 400; do
+              echo "depth-ticks $D:"
+              grep -E 'parity|^this/bitset|^liquibook' study/engine_dt$D.txt; echo
+            done
             echo '```'
             echo
             echo "### Cachegrind (depth-ticks 200, 400k book ops)"

@@ -125,9 +125,16 @@ allocator contest (Windows's heap punishes `std::map`'s node churn; glibc
 doesn't), not an algorithm one, and cachegrind confirms the D1 miss-rate gap
 is small (1.8 % vs 2.2 %). What holds on **both**: the sorted vector degrades
 badly on a deep book (Windows 6×, Linux 1.5×, tens of µs p99.9), and the
-bitset has the flattest tail across every configuration. It's the *safe*
-choice, not the fastest. Full method, cross-platform results, cachegrind and
-analysis: **[docs/study-order-book-structures.md](docs/study-order-book-structures.md)**
+bitset has the flattest tail across every configuration.
+
+Against **OCI liquibook** (an established open-source C++ matching engine),
+fed the identical stream and verified to emit byte-identical trades, this
+engine is **1.6–2.4× faster with a 3–5× tighter tail** on Windows:
+
+![engine vs liquibook](docs/images/engine_vs_liquibook.png)
+
+Full method, cross-platform results, cachegrind and analysis:
+**[docs/study-order-book-structures.md](docs/study-order-book-structures.md)**
 (reproduced by the `order-book study` GitHub Actions workflow).
 
 ---

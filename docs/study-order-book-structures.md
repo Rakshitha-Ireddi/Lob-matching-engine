@@ -40,6 +40,12 @@ allocator underneath is different.
 
 ![two platforms](images/book_platforms.png)
 
+**Against a real third-party engine** — [OCI liquibook](https://github.com/objectcomputing/liquibook),
+fed the identical stream and verified to produce byte-identical trades — this
+engine is **1.6–2.4× faster with a 3–5× tighter tail** on Windows, and (like
+the internal comparison) its throughput is flat with book depth where
+liquibook's per-order tree slows down.
+
 **So the honest conclusion is not "the bitset book wins."** It is:
 
 - The **bitset book is the *safe* choice** — its cost (and especially its tail)
@@ -122,6 +128,37 @@ On Linux the map/bitset gap **inverts** — `std::map` is level with or faster
 than the bitset at every point, and *much* faster under churn. The sorted
 vector still degrades on a deep book (1.5×) but nowhere near the 6× seen on
 Windows.
+
+### Versus a third-party engine — OCI liquibook
+
+[liquibook](https://github.com/objectcomputing/liquibook) is an established
+open-source C++ matching engine (Object Computing, Inc.). Its book is a
+different design point from all three above: a **per-order**
+`std::multimap<ComparablePrice, OrderTracker>` per side — one tree node per
+resting order, not per price level.
+
+`lob_bench --mode core --engine-compare` feeds both engines the identical
+NEW+CANCEL stream and hashes the resulting trade stream (price, quantity,
+aggressor side). **Parity check: the two engines produce byte-identical trade
+sequences** on every run — so this is a like-for-like measurement.
+
+| depth-ticks | this engine (bitset) | liquibook | speed-up | this p99.9 | liquibook p99.9 |
+|---:|---:|---:|---:|---:|---:|
+| 24 | 3.77 M/s | 2.37 M/s | **1.6×** | 2.0 µs | 8.2 µs |
+| 96 | 3.81 M/s | 1.57 M/s | **2.4×** | 1.7 µs | 10.6 µs |
+| 400 | 3.73 M/s | 1.66 M/s | **2.3×** | 2.2 µs | 7.8 µs |
+
+*(Windows / i3-1125G4, 8 M events, pinned. Market orders and modifies are
+excluded — liquibook's replace path is not exercised here.)*
+
+![engine vs liquibook](images/engine_vs_liquibook.png)
+
+This engine is **1.6–2.4× faster with a 3–5× tighter tail**, and — like the
+bitset book against `std::map` — its throughput is **flat with book depth**
+while liquibook's per-order tree slows as the resting-order count grows. The
+same allocator caveat applies: liquibook allocates a tree node per order, so on
+Linux/glibc the gap will be smaller than the Windows numbers above (the CI run
+measures it).
 
 ### Book-only microbench (`lob_bench --mode book`)
 
