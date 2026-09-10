@@ -1,0 +1,19 @@
+# build trees
+/build/
+/build-*/
+/out/
+
+# local benchmark logs (results JSON/CSV are committed as evidence)
+/bench-out/*.log
+
+# a fresh dashboard snapshot is committed as sample data; ignore local scratch
+/web/stats.local.json
+
+*.o
+*.obj
+*.exe
+compile_commands.json
+.cache/
+.vscode/
+.idea/
+__pycache__/

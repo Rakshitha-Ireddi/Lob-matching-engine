@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.png binary
+*.json -text
+web/vendor/* linguist-vendored
+tools/*.ps1 text eol=crlf
