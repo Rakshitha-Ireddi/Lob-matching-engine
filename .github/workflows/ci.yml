@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-latest
+            cc: clang
+            cxx: clang++
+          - os: windows-latest
+            cc: ""
+            cxx: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          ${{ matrix.cc && format('-DCMAKE_C_COMPILER={0} -DCMAKE_CXX_COMPILER={1}', matrix.cc, matrix.cxx) || '' }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j2
+
+      - name: Smoke benchmark
+        run: ./build/lob_bench --mode core --events 2000000 --seed 1 --json bench.json
+        shell: bash
+
+      - name: Upload benchmark
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.os }}-${{ matrix.cc || 'msvc' }}
+          path: bench.json
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: seanmiddleditch/gha-setup-ninja@v5
+      - name: Configure (ASan + UBSan)
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DLOB_ASAN=ON
+      - name: Build
+        run: cmake --build build
+      - name: Test under sanitizers
+        run: ctest --test-dir build --output-on-failure -j2
