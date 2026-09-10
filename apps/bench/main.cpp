@@ -116,10 +116,112 @@ CoreRun measure_core(const char* name, const lob::EngineConfig& ecfg,
     return run;
 }
 
-CoreRun dispatch_core(const std::string& book, const lob::EngineConfig& ec,
-                      const lob::FlowConfig& fc, std::uint64_t events,
-                      std::uint64_t warmup, const lob::TscClock& tsc,
-                      std::uint64_t ov) {
+// Book-only microbenchmark: replays the same flow but applies ONLY the order-book
+// operations (add / remove / best_bid / best_ask / snapshot) -- no matching, no
+// events. Isolates the data structure so a cache-behaviour tool (cachegrind,
+// perf) attributes every difference to the book. See docs/study-order-book-structures.md.
+template <class Book>
+CoreRun measure_book(const char* name, const lob::EngineConfig& ec,
+                     const lob::FlowConfig& fc, std::uint64_t events,
+                     std::uint64_t warmup, const lob::TscClock& tsc,
+                     std::uint64_t ov) {
+    Book book(ec.min_price, ec.max_price);
+    lob::OrderFlowGenerator gen(fc);
+
+    CoreRun run;
+    run.book = name;
+    run.events = events;
+
+    std::vector<lob::Order> arena(ec.max_orders);
+    std::vector<lob::Order*> freelist;
+    freelist.reserve(ec.max_orders);
+    for (std::size_t i = arena.size(); i-- > 0;) freelist.push_back(&arena[i]);
+    std::vector<lob::Order*> by_id;  // order id -> live Order*, or nullptr
+    std::vector<lob::DepthEntry> depth;
+    std::uint64_t sink = 0;
+
+    const auto attach = [&](const lob::Command& c) -> lob::Order* {
+        if (freelist.empty()) return nullptr;
+        lob::Order* o = freelist.back();
+        freelist.pop_back();
+        *o = lob::Order{};
+        o->id = c.id;
+        o->side = c.side;
+        o->price = c.price;
+        o->quantity = o->remaining = (c.quantity ? c.quantity : 1);
+        if (c.id >= by_id.size()) by_id.resize(c.id + 1, nullptr);
+        by_id[c.id] = o;
+        return o;
+    };
+    const auto detach = [&](lob::OrderId id) {
+        freelist.push_back(by_id[id]);
+        by_id[id] = nullptr;
+    };
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (std::uint64_t i = 0; i < events; ++i) {
+        const lob::Command c = gen.next();
+        const std::uint64_t c0 = lob::TscClock::raw();
+
+        switch (c.type) {
+            case lob::CommandType::New:
+                if (c.price != lob::kNoPrice && book.in_band(c.price)) {
+                    if (lob::Order* o = attach(c)) book.add(o);
+                }
+                break;
+            case lob::CommandType::Cancel:
+                if (c.id < by_id.size() && by_id[c.id]) {
+                    book.remove(by_id[c.id]);
+                    detach(c.id);
+                }
+                break;
+            case lob::CommandType::Modify:
+                if (c.id < by_id.size() && by_id[c.id]) {
+                    lob::Order* o = by_id[c.id];
+                    book.remove(o);
+                    o->price = (c.price == lob::kNoPrice) ? o->price : c.price;
+                    o->remaining = o->quantity = (c.quantity ? c.quantity : 1);
+                    if (book.in_band(o->price)) {
+                        book.add(o);
+                    } else {
+                        detach(c.id);
+                    }
+                }
+                break;
+        }
+
+        sink ^= static_cast<std::uint64_t>(book.best_bid());
+        sink ^= static_cast<std::uint64_t>(book.best_ask()) << 1;
+        if ((i & 63) == 0) {
+            book.snapshot(lob::Side::Buy, 10, depth);
+            sink += depth.size();
+        }
+
+        const std::uint64_t c1 = lob::TscClock::raw();
+        if (i >= warmup) {
+            const std::uint64_t d = (c1 - c0 > ov) ? (c1 - c0 - ov) : 0;
+            run.hist.record(tsc.to_nanos(d));
+        }
+    }
+    run.engine_wall_s = run.total_wall_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    run.resting_now = book.order_count();
+    g_checksum_sink = sink;
+    return run;
+}
+
+CoreRun dispatch_core(const std::string& book, bool book_only,
+                      const lob::EngineConfig& ec, const lob::FlowConfig& fc,
+                      std::uint64_t events, std::uint64_t warmup,
+                      const lob::TscClock& tsc, std::uint64_t ov) {
+    if (book_only) {
+        if (book == "map")
+            return measure_book<lob::MapOrderBook>("map", ec, fc, events, warmup, tsc, ov);
+        if (book == "flat" || book == "vector" || book == "sorted-vector")
+            return measure_book<lob::SortedVectorOrderBook>("flat", ec, fc, events, warmup,
+                                                            tsc, ov);
+        return measure_book<lob::OrderBook>("bitset", ec, fc, events, warmup, tsc, ov);
+    }
     if (book == "map")
         return measure_core<lob::MapOrderBook>("map", ec, fc, events, warmup, tsc, ov);
     if (book == "flat" || book == "vector" || book == "sorted-vector")
@@ -128,20 +230,18 @@ CoreRun dispatch_core(const std::string& book, const lob::EngineConfig& ec,
     return measure_core<lob::OrderBook>("bitset", ec, fc, events, warmup, tsc, ov);
 }
 
-void report_core(const CoreRun& run) {
-    const auto& st = run.stats;
-    const double fill = st.new_orders
-                            ? static_cast<double>(st.trades) / static_cast<double>(st.new_orders)
-                            : 0.0;
+void report_core(const CoreRun& run, bool book_only) {
+    const char* unit = book_only ? "op/s" : "cmd/s";
+    const char* scope = book_only ? "book op -> best-bid/ask updated"
+                                  : "command -> all events emitted";
     std::printf("\n[%s] throughput\n", run.book.c_str());
-    std::printf("  engine steady-state   %10.0f cmd/s  (%.2f ns/cmd)\n",
-                static_cast<double>(run.events) / run.engine_wall_s,
+    std::printf("  %-18s %12.0f %s  (%.2f ns each)\n",
+                book_only ? "book ops" : "engine steady-state",
+                static_cast<double>(run.events) / run.engine_wall_s, unit,
                 run.engine_wall_s * 1e9 / static_cast<double>(run.events));
-    std::printf("  incl. flow-gen        %10.0f cmd/s\n",
-                static_cast<double>(run.events) / run.total_wall_s);
 
-    std::printf("\n[%s] latency  (command -> all events emitted, n=%.0f)\n",
-                run.book.c_str(), static_cast<double>(run.hist.count()));
+    std::printf("\n[%s] latency  (%s, n=%.0f)\n", run.book.c_str(), scope,
+                static_cast<double>(run.hist.count()));
     print_row("min", run.hist.min());
     print_row("p50", run.hist.percentile(50));
     print_row("p90", run.hist.percentile(90));
@@ -151,10 +251,20 @@ void report_core(const CoreRun& run) {
     print_row("max", run.hist.max());
     std::printf("  %-22s %8.1f ns\n", "mean", run.hist.mean());
 
-    std::printf("\n[%s] work: trades %llu, shares %llu, rejects %llu, fill %.3f, resting %zu\n",
-                run.book.c_str(), (unsigned long long)st.trades,
-                (unsigned long long)st.shares_traded, (unsigned long long)st.rejects, fill,
-                run.resting_now);
+    if (!book_only) {
+        const auto& st = run.stats;
+        const double fill =
+            st.new_orders
+                ? static_cast<double>(st.trades) / static_cast<double>(st.new_orders)
+                : 0.0;
+        std::printf(
+            "\n[%s] work: trades %llu, shares %llu, rejects %llu, fill %.3f, resting %zu\n",
+            run.book.c_str(), (unsigned long long)st.trades,
+            (unsigned long long)st.shares_traded, (unsigned long long)st.rejects, fill,
+            run.resting_now);
+    } else {
+        std::printf("\n[%s] resting orders now %zu\n", run.book.c_str(), run.resting_now);
+    }
 }
 
 lob::BenchResult to_bench_result(const CoreRun& run) {
@@ -193,8 +303,8 @@ lob::BenchResult to_bench_result(const CoreRun& run) {
     return r;
 }
 
-int run_core(const Args& args) {
-    const std::uint64_t events = args.u64("events", 5'000'000);
+int run_core(const Args& args, bool book_only) {
+    const std::uint64_t events = args.u64("events", book_only ? 3'000'000 : 5'000'000);
     const std::uint64_t warmup =
         args.u64("warmup", std::min<std::uint64_t>(events / 10, 1'000'000));
     const std::uint64_t seed = args.u64("seed", 42);
@@ -229,7 +339,7 @@ int run_core(const Args& args) {
     lob::TscClock tsc;
     const std::uint64_t ov = tsc_overhead_cycles(tsc);
 
-    std::printf("lob_bench / core\n");
+    std::printf("lob_bench / %s\n", book_only ? "book (data-structure only)" : "core");
     std::printf("  host        : %s / %s\n", cpu_brand().c_str(), os_name().c_str());
     std::printf("  build       : %s, %s\n", compiler_id().c_str(),
 #ifdef NDEBUG
@@ -257,8 +367,8 @@ int run_core(const Args& args) {
         std::vector<CoreRun> runs;
         for (const char* b : {"bitset", "map", "flat"}) {
             std::fflush(stdout);
-            runs.push_back(dispatch_core(b, ecfg, fcfg, events, warmup, tsc, ov));
-            report_core(runs.back());
+            runs.push_back(dispatch_core(b, book_only, ecfg, fcfg, events, warmup, tsc, ov));
+            report_core(runs.back(), book_only);
         }
 
         const double base_tput =
@@ -294,8 +404,8 @@ int run_core(const Args& args) {
     }
 
     const std::string book = args.str("book", "bitset");
-    const CoreRun run = dispatch_core(book, ecfg, fcfg, events, warmup, tsc, ov);
-    report_core(run);
+    const CoreRun run = dispatch_core(book, book_only, ecfg, fcfg, events, warmup, tsc, ov);
+    report_core(run, book_only);
 
     if (!js.empty()) {
         lob::write_json_file(js, lob::to_json(to_bench_result(run)));
@@ -473,15 +583,18 @@ int main(int argc, char** argv) {
     const std::string mode = args.str("mode", "core");
     if (args.has("help")) {
         std::printf(
-            "usage: lob_bench --mode core|e2e [options]\n"
-            "  core: --events N --warmup N --seed S --band-min P --band-max P --mid P\n"
-            "        --pool N --clients N --p-new f --p-cancel f --p-market f --p-aggressive f\n"
-            "        --depth-ticks N --pin --cpu N --json file --csv file --no-book-events\n"
+            "usage: lob_bench --mode core|book|e2e [options]\n"
+            "  core: full matching engine. --events N --warmup N --seed S --band-min P\n"
+            "        --band-max P --mid P --pool N --clients N --p-new f --p-cancel f\n"
+            "        --p-market f --p-aggressive f --depth-ticks N --pin --cpu N\n"
+            "        --json file --csv file --no-book-events\n"
             "        --book bitset|map|flat      pick the order-book data structure\n"
             "        --compare                   run all three books on identical flow\n"
+            "  book: order-book operations only, no matching -- for cachegrind / perf.\n"
+            "        same options; --book / --compare apply.\n"
             "  e2e : --events N --port P --md-port P --seed S --json file\n");
         return 0;
     }
     if (mode == "e2e") return run_e2e(args);
-    return run_core(args);
+    return run_core(args, mode == "book");
 }
