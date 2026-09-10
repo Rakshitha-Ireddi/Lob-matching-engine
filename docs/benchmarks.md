@@ -107,6 +107,34 @@ run has a handful of samples in the tens-of-µs-to-ms range and typically one
 an isolated, `tickless` Linux core does not show them. They are reported
 as-measured rather than filtered.
 
+## Sustainable throughput (open-loop)
+
+`lob_bench --mode core` is *closed-loop* — it never issues the next command
+until the current returns, so it measures **service time** and cannot see
+queueing. `lob_bench --mode load` issues commands on a wall-clock schedule at a
+target rate and measures each command's **response time from its scheduled
+arrival** (coordinated-omission-free). Sweeping the offered rate:
+
+![latency vs load](images/latency_vs_load.png)
+
+| offered | achieved | p50 response | p99 |
+|---:|---:|---:|---:|
+| 1.0 M/s | 1.0 M/s | 0.4 µs | ~12 µs |
+| 2.0 M/s | 2.0 M/s | 0.3–0.6 µs | ~50 µs–3 ms\* |
+| **2.25 M/s** | 2.25 M/s | **~1 µs** | knee |
+| 2.5 M/s | 2.4–2.5 M/s | **16–28 ms** | saturated |
+| 3.0 M/s | ~2.8–3.0 M/s (ceiling) | tens of ms | — |
+
+\*the p99/p99.9 at low load (tens of µs to low-ms) is the Windows scheduler
+preempting the pinned thread, same as the closed-loop tail.
+
+**The p50 response time stays sub-microsecond up to ~2.2 M commands/s, then
+goes vertical.** Peak *service* rate on this box is ~2.8–3.3 M/s (thermal), but
+the rate at which latency stays bounded — the number you'd actually provision
+for — is **~2 M/s, roughly 70 % of the service ceiling**, which is the usual
+queueing result. Poisson and uniform arrivals give the same knee; Poisson is
+burstier and reaches it slightly sooner.
+
 ## Order-book data structure comparison
 
 `lob_bench --mode core --compare` runs the identical matching logic and order

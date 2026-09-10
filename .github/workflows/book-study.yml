@@ -46,10 +46,18 @@ jobs:
           mkdir -p study
           for D in 16 48 200 800; do
             ./build/lob_bench --mode core --events 10000000 --seed 1 \
-              --depth-ticks $D --compare --json study/compare_dt$D.json | tee study/compare_dt$D.txt
+              --depth-ticks $D --compare --with-pooled-map \
+              --json study/compare_dt$D.json | tee study/compare_dt$D.txt
           done
           ./build/lob_bench --mode core --events 10000000 --seed 1 --depth-ticks 120 \
-            --p-new 0.44 --p-cancel 0.5 --compare --json study/compare_churn.json | tee study/compare_churn.txt
+            --p-new 0.44 --p-cancel 0.5 --compare --with-pooled-map \
+            --json study/compare_churn.json | tee study/compare_churn.txt
+
+      - name: Open-loop response time vs offered load
+        run: |
+          ./build/lob_bench --mode load --events 2500000 --seed 1 --depth-ticks 48 \
+            --rate-sweep 0.5,1.0,1.5,2.0,2.25,2.5,2.75,3.0,3.5 \
+            --json study/load_sweep.json | tee study/load_sweep.txt
 
       - name: Book-only microbench
         run: |
@@ -108,6 +116,11 @@ jobs:
               echo "depth-ticks $D:"; sed -n '/^book /,/^flat /p' study/compare_dt$D.txt; echo
             done
             echo "churn (50% cancels):"; sed -n '/^book /,/^flat /p' study/compare_churn.txt
+            echo '```'
+            echo
+            echo "### Open-loop response time vs offered load"
+            echo '```'
+            sed -n '/offered/,/^$/p' study/load_sweep.txt
             echo '```'
             echo
             echo "### Book-only microbench (no matching, 5M ops)"

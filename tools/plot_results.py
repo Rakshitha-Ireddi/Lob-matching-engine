@@ -259,6 +259,74 @@ def plot_book_platforms(win_files, lin_files, outdir):
     plt.close(fig)
 
 
+def plot_load(paths, outdir):
+    """paths: list of load_sweep json docs (one per arrival distribution)."""
+    paths = [p for p in paths if os.path.exists(p)]
+    if not paths:
+        return
+    fig, ax = plt.subplots(figsize=(8.5, 4.6))
+    ax2 = ax.twinx()
+    styles = {"poisson": "-", "uniform": "--"}
+    for path in paths:
+        d = json.load(open(path))
+        arr = d.get("arrivals", "poisson")
+        pts = sorted(d["points"], key=lambda p: p["offered_ops"])
+        off = [p["offered_ops"] / 1e6 for p in pts]
+        for key, col, lab in [("p50_ns", ACCENT, "p50"),
+                              ("p99_ns", "#c98a2f", "p99"),
+                              ("p999_ns", "#b0453a", "p99.9")]:
+            ax.plot(off, [p[key] for p in pts], styles.get(arr, "-"),
+                    marker="o", color=col, linewidth=2,
+                    label=f"{lab} ({arr})" if len(paths) > 1 else lab)
+        ax2.plot(off, [p["achieved_ops"] / 1e6 for p in pts], ":", color="#777",
+                 linewidth=1.5, label="achieved rate" if path == paths[0] else None)
+    ax.set_yscale("log")
+    ax.set_yticks([100, 1000, 10000, 100000, 1000000, 10000000])
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(fmt_ns))
+    ax.yaxis.set_minor_formatter(mticker.NullFormatter())
+    ax.set_xlabel("offered load  (M commands / sec)")
+    ax.set_ylabel("response time  (log)")
+    ax2.set_ylabel("achieved throughput (M/s)")
+    ax2.set_ylim(bottom=0)
+    ax.set_title("Open-loop response time vs. offered load  —  the latency knee")
+    ax.legend(frameon=False, fontsize=9, loc="upper left")
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, "latency_vs_load.png"), dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_allocator(files, outdir):
+    """files: (depth, path) for --compare --with-pooled-map json docs."""
+    files = [(d, p) for d, p in files if os.path.exists(p)]
+    if not files:
+        return
+    files.sort()
+    depths = [d for d, _ in files]
+    ser = {"map": [], "map-pooled": []}
+    for _, path in files:
+        runs = {r["mode"].split("/")[-1]: r["throughput_ops"]
+                for r in json.load(open(path))["runs"]}
+        base = runs.get("bitset")
+        for k in ser:
+            if k in runs and base:
+                ser[k].append(base / runs[k])
+    fig, ax = plt.subplots(figsize=(7.5, 4))
+    ax.plot(depths, ser["map"], "o-", color="#c98a2f", linewidth=2,
+            label="std::map  (std::allocator)")
+    ax.plot(depths, ser["map-pooled"], "s--", color="#7a5a1f", linewidth=2,
+            label="std::map  (pooled node allocator)")
+    ax.axhline(1.0, color="#444", linewidth=1)
+    ax.annotate("bitset baseline", (depths[-1], 1.0), fontsize=9, ha="right", va="bottom")
+    ax.set_xscale("log")
+    ax.set_xlabel("price scatter (ticks from mid)")
+    ax.set_ylabel("throughput ratio vs bitset  (>1 = slower)")
+    ax.set_title("Pooling the map nodes shrinks the Windows gap (fully closes it on a wide book)")
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, "allocator.png"), dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_engine_vs_liquibook(files, outdir):
     """files: list of (depth, path) for --engine-compare json docs."""
     if not files:
@@ -342,6 +410,15 @@ def main():
         if m:
             eng.append((int(m.group(1)), p))
     plot_engine_vs_liquibook(eng, a.outdir)
+
+    plot_load(["bench-out/load_sweep.json", "bench-out/load_sweep_uniform.json"], a.outdir)
+
+    alloc = []
+    for p in glob.glob("bench-out/alloc_dt*.json"):
+        m = re.search(r"alloc_dt(\d+)", os.path.basename(p))
+        if m:
+            alloc.append((int(m.group(1)), p))
+    plot_allocator(alloc, a.outdir)
 
     print(f"wrote charts to {a.outdir}/")
 

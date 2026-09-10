@@ -36,7 +36,9 @@ level that is created or destroyed. Windows's default heap makes that
 expensive; glibc's `malloc` (with its per-thread arenas and fast bins) makes it
 cheap enough that the tree's O(log L) beats the bitset's fixed O(band/64)
 best-price scan. Same C++, same `libstdc++`, opposite ranking — because the
-allocator underneath is different.
+allocator underneath is different. Swapping in a **pooled node allocator**
+confirms it directly: it recovers 20–100 % of the Windows gap (all of it on a
+wide book) — see *Testing the allocator claim* below.
 
 ![two platforms](images/book_platforms.png)
 
@@ -189,15 +191,41 @@ on throughput despite the lower miss rate: its extra instructions are
 straight-line and branch-predictable, cachegrind's `--branch-sim=no` model
 does not credit that.
 
+### Testing the allocator claim directly
+
+If the Windows gap is really about node allocation, swapping `std::allocator`
+for a **pooled node allocator** (`lob::NodePoolAllocator` — one free list, all
+`std::map` nodes are the same size) should recover most of it.
+`lob_bench --compare --with-pooled-map` adds that fourth book; it is
+byte-identical to plain `std::map`
+([test](../tests/test_book_equivalence.cpp)).
+
+| depth-ticks | `std::map` vs bitset | `std::map` **pooled** vs bitset | gap recovered |
+|---:|---:|---:|---:|
+| 48 | 1.21× | **1.16×** | ~25 % |
+| 200 | 1.27× | **1.22×** | ~20 % |
+| 800 | 1.06× | **1.00×** (matches bitset) | 100 % |
+
+![allocator](images/allocator.png)
+
+Pooling **fully closes the gap on a wide book** and takes ~20–25 % off it at
+moderate depth, and it also tightens the tail (p99.9 at depth 200:
+3.8 µs → 3.2 µs). The residual ~1.15–1.2× at moderate depth is the genuine
+`log L` tree-descent + comparison + cache cost — which is exactly the size of
+the cachegrind D1 gap (1.8 % vs 2.2 %). So the refined claim: **the Windows
+`std::map` penalty is *mostly* allocation on a wide book and *part*
+allocation elsewhere; the rest is real tree-walk cost, and it is small.**
+
 ## Analysis
 
-**`std::map` vs the bitset is an allocator contest, not an algorithm contest.**
-Every price level created or destroyed is a `map` node `new`/`delete`. At L in
-the hundreds–thousands the tree itself is a few tens of KB and the `log L`
-descent is cheap; the cost that actually moves is allocation. Windows's default
-heap makes node churn expensive enough that the bitset's bit-flip wins by
-10–50 %. glibc's `malloc` makes it cheap enough that `std::map` wins. The
-cachegrind D1 gap (1.8 % → 2.2 %) is the secondary effect and it is minor.
+**`std::map` vs the bitset is mostly an allocator contest.** Every price level
+created or destroyed is a `map` node `new`/`delete`. At L in the
+hundreds–thousands the tree itself is a few tens of KB and the `log L` descent
+is cheap; the cost that actually moves is allocation. Windows's default heap
+makes node churn expensive enough that the bitset's bit-flip wins by 10–50 %;
+glibc's `malloc` makes it cheap enough that `std::map` wins; and a pooled node
+allocator recovers 20–100 % of the Windows gap (previous section). The
+cachegrind D1 gap (1.8 % → 2.2 %) is the residual, and it is minor.
 
 **The bitset's structural cost is real and platform-independent.**
 `best_price` is `O(band / 64)` regardless of L. With a 200 k-tick band and only

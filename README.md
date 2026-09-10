@@ -106,9 +106,17 @@ python tools/plot_results.py       # -> docs/images/*.png
 Across three seeds (20 M events each, brief cooldown between) the spread is
 tight: **3.2–3.4 M cmd/s, p50 207–229 ns, p99 785–832 ns**. Best single
 observed run was 3.65 M / 175 ns p50; sustained back-to-back 50 M runs with no
-cooldown throttle this 15 W chip to ~2.5 M / ~300 ns p50. Percentiles through
-p99.9 hold across all of it. Per-seed table and the tuned-Linux reference
-target: **[docs/benchmarks.md](docs/benchmarks.md)**.
+cooldown throttle this 15 W chip to ~2.5 M / ~300 ns p50.
+
+That's *service time* (closed-loop). `lob_bench --mode load` measures
+**response time under a fixed offered rate** (coordinated-omission-free): p50
+stays sub-microsecond up to **~2.2 M commands/s**, then goes vertical — so the
+usable rate is ~70 % of the ~3 M/s service ceiling, the usual queueing result.
+
+![latency vs load](docs/images/latency_vs_load.png)
+
+Per-seed table, the load-knee sweep and the tuned-Linux reference target:
+**[docs/benchmarks.md](docs/benchmarks.md)**.
 
 ### Order-book structure comparison
 
@@ -120,12 +128,13 @@ Linux CI):
 
 ![two platforms](docs/images/book_platforms.png)
 
-The `std::map` vs bitset ranking **flips between the two hosts** — it's an
-allocator contest (Windows's heap punishes `std::map`'s node churn; glibc
-doesn't), not an algorithm one, and cachegrind confirms the D1 miss-rate gap
-is small (1.8 % vs 2.2 %). What holds on **both**: the sorted vector degrades
-badly on a deep book (Windows 6×, Linux 1.5×, tens of µs p99.9), and the
-bitset has the flattest tail across every configuration.
+The `std::map` vs bitset ranking **flips between the two hosts** — it's mostly
+an allocator contest (Windows's heap punishes `std::map`'s node churn; glibc
+doesn't). Swapping in a pooled node allocator recovers 20–100 % of the Windows
+gap directly, and cachegrind puts the residual D1 miss-rate difference at just
+1.8 % vs 2.2 %. What holds on **both** hosts: the sorted vector degrades badly
+on a deep book (Windows 6×, Linux 1.5×, tens of µs p99.9), and the bitset has
+the flattest tail across every configuration.
 
 Against **OCI liquibook** (an established open-source C++ matching engine),
 fed the identical stream and verified to emit byte-identical trades, this
