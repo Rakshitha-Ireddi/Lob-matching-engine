@@ -26,8 +26,10 @@
 #include "lob/clock.hpp"
 #include "lob/engine_server.hpp"
 #include "lob/latency_histogram.hpp"
+#include "lob/map_order_book.hpp"
 #include "lob/matching_engine.hpp"
 #include "lob/order_flow.hpp"
+#include "lob/sorted_vector_order_book.hpp"
 #include "lob/telemetry.hpp"
 #include "lob/wire.hpp"
 #include "lob/net.hpp"
@@ -35,6 +37,8 @@
 namespace {
 
 using lob::LatencyHistogram;
+
+volatile std::uint64_t g_checksum_sink = 0;
 
 std::uint64_t tsc_overhead_cycles(const lob::TscClock& tsc) {
     std::uint64_t best = ~0ULL;
@@ -54,9 +58,145 @@ void print_row(const char* label, std::uint64_t ns) {
         std::printf("  %-22s %8llu ns\n", label, static_cast<unsigned long long>(ns));
 }
 
+struct CoreRun {
+    std::string book;
+    double engine_wall_s = 0.0;
+    double total_wall_s = 0.0;
+    lob::EngineStats stats{};
+    std::size_t resting_now = 0;
+    std::uint64_t events = 0;
+    LatencyHistogram hist{60'000'000ULL, 3};
+};
+
+template <class Book>
+CoreRun measure_core(const char* name, const lob::EngineConfig& ecfg,
+                     const lob::FlowConfig& fcfg, std::uint64_t events,
+                     std::uint64_t warmup, const lob::TscClock& tsc,
+                     std::uint64_t ov) {
+    lob::BasicMatchingEngine<Book> engine(ecfg);
+    lob::OrderFlowGenerator gen(fcfg);
+
+    CoreRun run;
+    run.book = name;
+    run.events = events;
+
+    const std::size_t chunk = 1u << 16;
+    std::vector<lob::Command> batch(chunk);
+    std::uint64_t done = 0;
+    std::uint64_t checksum = 0;
+    const auto t_start = std::chrono::steady_clock::now();
+
+    while (done < events) {
+        const std::size_t n =
+            static_cast<std::size_t>(std::min<std::uint64_t>(chunk, events - done));
+        for (std::size_t i = 0; i < n; ++i) batch[i] = gen.next();
+
+        const auto cw0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::uint64_t c0 = lob::TscClock::raw();
+            const std::span<const lob::Event> evs = engine.process(batch[i]);
+            const std::uint64_t c1 = lob::TscClock::raw();
+            if (done + i >= warmup) {
+                const std::uint64_t d = (c1 - c0 > ov) ? (c1 - c0 - ov) : 0;
+                run.hist.record(tsc.to_nanos(d));
+            }
+            for (const auto& e : evs)
+                checksum += e.price + e.quantity + static_cast<std::uint64_t>(e.type);
+        }
+        run.engine_wall_s +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - cw0).count();
+        done += n;
+    }
+    run.total_wall_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+    run.stats = engine.stats();
+    run.resting_now = engine.resting_orders();
+
+    g_checksum_sink = checksum;  // keep the event walk from being elided
+    return run;
+}
+
+CoreRun dispatch_core(const std::string& book, const lob::EngineConfig& ec,
+                      const lob::FlowConfig& fc, std::uint64_t events,
+                      std::uint64_t warmup, const lob::TscClock& tsc,
+                      std::uint64_t ov) {
+    if (book == "map")
+        return measure_core<lob::MapOrderBook>("map", ec, fc, events, warmup, tsc, ov);
+    if (book == "flat" || book == "vector" || book == "sorted-vector")
+        return measure_core<lob::SortedVectorOrderBook>("flat", ec, fc, events, warmup,
+                                                        tsc, ov);
+    return measure_core<lob::OrderBook>("bitset", ec, fc, events, warmup, tsc, ov);
+}
+
+void report_core(const CoreRun& run) {
+    const auto& st = run.stats;
+    const double fill = st.new_orders
+                            ? static_cast<double>(st.trades) / static_cast<double>(st.new_orders)
+                            : 0.0;
+    std::printf("\n[%s] throughput\n", run.book.c_str());
+    std::printf("  engine steady-state   %10.0f cmd/s  (%.2f ns/cmd)\n",
+                static_cast<double>(run.events) / run.engine_wall_s,
+                run.engine_wall_s * 1e9 / static_cast<double>(run.events));
+    std::printf("  incl. flow-gen        %10.0f cmd/s\n",
+                static_cast<double>(run.events) / run.total_wall_s);
+
+    std::printf("\n[%s] latency  (command -> all events emitted, n=%.0f)\n",
+                run.book.c_str(), static_cast<double>(run.hist.count()));
+    print_row("min", run.hist.min());
+    print_row("p50", run.hist.percentile(50));
+    print_row("p90", run.hist.percentile(90));
+    print_row("p99", run.hist.percentile(99));
+    print_row("p99.9", run.hist.percentile(99.9));
+    print_row("p99.99", run.hist.percentile(99.99));
+    print_row("max", run.hist.max());
+    std::printf("  %-22s %8.1f ns\n", "mean", run.hist.mean());
+
+    std::printf("\n[%s] work: trades %llu, shares %llu, rejects %llu, fill %.3f, resting %zu\n",
+                run.book.c_str(), (unsigned long long)st.trades,
+                (unsigned long long)st.shares_traded, (unsigned long long)st.rejects, fill,
+                run.resting_now);
+}
+
+lob::BenchResult to_bench_result(const CoreRun& run) {
+    const auto& st = run.stats;
+    lob::BenchResult r;
+    r.mode = "core/" + run.book;
+    r.host = os_name();
+    r.cpu = cpu_brand();
+    r.build =
+#ifdef NDEBUG
+        "Release";
+#else
+        "Debug";
+#endif
+    r.compiler = compiler_id();
+    r.events = run.events;
+    r.wall_s = run.engine_wall_s;
+    r.throughput_ops = static_cast<double>(run.events) / run.engine_wall_s;
+    r.trades = st.trades;
+    r.shares = st.shares_traded;
+    r.rejects = st.rejects;
+    r.peak_resting = st.peak_resting;
+    r.fill_ratio = st.new_orders ? static_cast<double>(st.trades) /
+                                       static_cast<double>(st.new_orders)
+                                 : 0.0;
+    r.lat_scope = "engine command->events (" + run.book + " book)";
+    r.lat_min = run.hist.min();
+    r.lat_p50 = run.hist.percentile(50);
+    r.lat_p90 = run.hist.percentile(90);
+    r.lat_p99 = run.hist.percentile(99);
+    r.lat_p999 = run.hist.percentile(99.9);
+    r.lat_p9999 = run.hist.percentile(99.99);
+    r.lat_max = run.hist.max();
+    r.lat_mean = run.hist.mean();
+    r.hist = run.hist.log_bins(10);
+    return r;
+}
+
 int run_core(const Args& args) {
     const std::uint64_t events = args.u64("events", 5'000'000);
-    const std::uint64_t warmup = args.u64("warmup", std::min<std::uint64_t>(events / 10, 1'000'000));
+    const std::uint64_t warmup =
+        args.u64("warmup", std::min<std::uint64_t>(events / 10, 1'000'000));
     const std::uint64_t seed = args.u64("seed", 42);
     const lob::Price band_min = args.i64("band-min", 1);
     const lob::Price band_max = args.i64("band-max", 200'000);
@@ -80,9 +220,6 @@ int run_core(const Args& args) {
     fcfg.p_aggressive = args.f64("p-aggressive", 0.28);
     fcfg.depth_ticks = static_cast<int>(args.i64("depth-ticks", 48));
     fcfg.clients = static_cast<lob::ClientId>(args.u64("clients", 8));
-
-    lob::MatchingEngine engine(ecfg);
-    lob::OrderFlowGenerator gen(fcfg);
 
     std::string pin_detail = "not pinned";
     if (args.flag("pin")) {
@@ -112,107 +249,61 @@ int run_core(const Args& args) {
     std::printf("  scheduling  : %s\n", pin_detail.c_str());
     std::fflush(stdout);
 
-    LatencyHistogram hist{60'000'000ULL, 3};
-    const std::size_t chunk = 1u << 16;
-    std::vector<lob::Command> batch(chunk);
-
-    std::uint64_t done = 0;
-    std::uint64_t checksum = 0;
-    double engine_wall_s = 0.0;
-    const auto t_start = std::chrono::steady_clock::now();
-
-    while (done < events) {
-        const std::size_t n =
-            static_cast<std::size_t>(std::min<std::uint64_t>(chunk, events - done));
-        for (std::size_t i = 0; i < n; ++i) batch[i] = gen.next();
-
-        const auto cw0 = std::chrono::steady_clock::now();
-        for (std::size_t i = 0; i < n; ++i) {
-            const std::uint64_t c0 = lob::TscClock::raw();
-            const std::span<const lob::Event> evs = engine.process(batch[i]);
-            const std::uint64_t c1 = lob::TscClock::raw();
-
-            const bool measure = done + i >= warmup;
-            if (measure) {
-                std::uint64_t d = (c1 - c0 > ov) ? (c1 - c0 - ov) : 0;
-                hist.record(tsc.to_nanos(d));
-            }
-            for (const auto& e : evs) checksum += e.price + e.quantity + static_cast<std::uint64_t>(e.type);
-        }
-        engine_wall_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - cw0).count();
-        done += n;
-    }
-    const double total_wall_s =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
-
-    const auto& st = engine.stats();
-    const double measured = static_cast<double>(hist.count());
-    const double fill_ratio =
-        st.new_orders ? static_cast<double>(st.trades) / static_cast<double>(st.new_orders) : 0.0;
-
-    std::printf("\nthroughput\n");
-    std::printf("  engine steady-state   %10.0f cmd/s  (%.2f ns/cmd)\n",
-                static_cast<double>(events) / engine_wall_s,
-                engine_wall_s * 1e9 / static_cast<double>(events));
-    std::printf("  incl. flow-gen        %10.0f cmd/s\n",
-                static_cast<double>(events) / total_wall_s);
-
-    std::printf("\nlatency  (command -> all events emitted, n=%.0f)\n", measured);
-    print_row("min", hist.min());
-    print_row("p50", hist.percentile(50));
-    print_row("p90", hist.percentile(90));
-    print_row("p99", hist.percentile(99));
-    print_row("p99.9", hist.percentile(99.9));
-    print_row("p99.99", hist.percentile(99.99));
-    print_row("max", hist.max());
-    std::printf("  %-22s %8.1f ns\n", "mean", hist.mean());
-
-    std::printf("\nwork done\n");
-    std::printf("  trades %llu, shares %llu, rejects %llu, peak resting %llu\n",
-                (unsigned long long)st.trades, (unsigned long long)st.shares_traded,
-                (unsigned long long)st.rejects, (unsigned long long)st.peak_resting);
-    std::printf("  fill ratio (trades/new) %.3f, resting now %zu\n", fill_ratio,
-                engine.resting_orders());
-    std::printf("  checksum %llu\n", (unsigned long long)checksum);
-
-    lob::BenchResult r;
-    r.mode = "core";
-    r.host = os_name();
-    r.cpu = cpu_brand();
-    r.build =
-#ifdef NDEBUG
-        "Release";
-#else
-        "Debug";
-#endif
-    r.compiler = compiler_id();
-    r.events = events;
-    r.wall_s = engine_wall_s;
-    r.throughput_ops = static_cast<double>(events) / engine_wall_s;
-    r.trades = st.trades;
-    r.shares = st.shares_traded;
-    r.rejects = st.rejects;
-    r.peak_resting = st.peak_resting;
-    r.fill_ratio = fill_ratio;
-    r.lat_scope = "engine command->events";
-    r.lat_min = hist.min();
-    r.lat_p50 = hist.percentile(50);
-    r.lat_p90 = hist.percentile(90);
-    r.lat_p99 = hist.percentile(99);
-    r.lat_p999 = hist.percentile(99.9);
-    r.lat_p9999 = hist.percentile(99.99);
-    r.lat_max = hist.max();
-    r.lat_mean = hist.mean();
-    r.hist = hist.log_bins(10);   // compact, for the JSON document
-
     const std::string js = args.str("json", "");
+
+    if (args.flag("compare")) {
+        std::printf("\ncomparing order-book data structures (identical flow, %llu events)\n",
+                    static_cast<unsigned long long>(events));
+        std::vector<CoreRun> runs;
+        for (const char* b : {"bitset", "map", "flat"}) {
+            std::fflush(stdout);
+            runs.push_back(dispatch_core(b, ecfg, fcfg, events, warmup, tsc, ov));
+            report_core(runs.back());
+        }
+
+        const double base_tput =
+            static_cast<double>(runs[0].events) / runs[0].engine_wall_s;
+        std::printf(
+            "\n%-8s %12s %10s %9s %9s %9s %9s %8s\n", "book", "cmd/s", "ns/cmd",
+            "p50", "p90", "p99", "p99.9", "vs bit");
+        for (const auto& r : runs) {
+            const double tput = static_cast<double>(r.events) / r.engine_wall_s;
+            std::printf("%-8s %12.0f %10.1f %9llu %9llu %9llu %9llu %7.2fx\n",
+                        r.book.c_str(), tput,
+                        r.engine_wall_s * 1e9 / static_cast<double>(r.events),
+                        (unsigned long long)r.hist.percentile(50),
+                        (unsigned long long)r.hist.percentile(90),
+                        (unsigned long long)r.hist.percentile(99),
+                        (unsigned long long)r.hist.percentile(99.9),
+                        base_tput / tput);
+        }
+
+        if (!js.empty()) {
+            std::string doc = "{\n  \"mode\": \"core-compare\",\n  \"events\": " +
+                              std::to_string(events) + ",\n  \"cpu\": \"" + cpu_brand() +
+                              "\",\n  \"host\": \"" + os_name() + "\",\n  \"runs\": [\n";
+            for (std::size_t i = 0; i < runs.size(); ++i) {
+                doc += "    " + lob::to_json(to_bench_result(runs[i]));
+                doc += (i + 1 < runs.size()) ? ",\n" : "\n";
+            }
+            doc += "  ]\n}\n";
+            lob::write_json_file(js, doc);
+            std::printf("\nwrote %s\n", js.c_str());
+        }
+        return 0;
+    }
+
+    const std::string book = args.str("book", "bitset");
+    const CoreRun run = dispatch_core(book, ecfg, fcfg, events, warmup, tsc, ov);
+    report_core(run);
+
     if (!js.empty()) {
-        lob::write_json_file(js, lob::to_json(r));
+        lob::write_json_file(js, lob::to_json(to_bench_result(run)));
         std::printf("\nwrote %s\n", js.c_str());
     }
     const std::string csv = args.str("csv", "");
     if (!csv.empty()) {
-        lob::write_hist_csv(csv, hist.bins());   // full fidelity, for plotting
+        lob::write_hist_csv(csv, run.hist.bins());
         std::printf("wrote %s\n", csv.c_str());
     }
     return 0;
@@ -385,7 +476,9 @@ int main(int argc, char** argv) {
             "usage: lob_bench --mode core|e2e [options]\n"
             "  core: --events N --warmup N --seed S --band-min P --band-max P --mid P\n"
             "        --pool N --clients N --p-new f --p-cancel f --p-market f --p-aggressive f\n"
-            "        --json file --csv file --no-book-events\n"
+            "        --depth-ticks N --pin --cpu N --json file --csv file --no-book-events\n"
+            "        --book bitset|map|flat      pick the order-book data structure\n"
+            "        --compare                   run all three books on identical flow\n"
             "  e2e : --events N --port P --md-port P --seed S --json file\n");
         return 0;
     }
