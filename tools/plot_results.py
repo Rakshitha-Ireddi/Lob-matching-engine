@@ -18,6 +18,7 @@ import csv
 import glob
 import json
 import os
+import re
 
 import matplotlib
 
@@ -170,12 +171,59 @@ def plot_book(snapshot, outdir):
     plt.close(fig)
 
 
+BOOK_COLOR = {"bitset": "#2f6f9f", "map": "#c98a2f", "flat": "#b0453a"}
+
+
+def plot_book_comparison(compare_files, outdir):
+    """compare_files: list of (depth_ticks:int, path) for `--compare` json docs."""
+    if not compare_files:
+        return
+    compare_files.sort()
+    depths = [d for d, _ in compare_files]
+    series = {b: {"tput": [], "p99": [], "p999": []} for b in ("bitset", "map", "flat")}
+    for _, path in compare_files:
+        doc = json.load(open(path))
+        for r in doc["runs"]:
+            b = r["mode"].split("/")[-1]
+            if b not in series:
+                continue
+            series[b]["tput"].append(r["throughput_ops"] / 1e6)
+            series[b]["p99"].append(r["latency_ns"]["p99"])
+            series[b]["p999"].append(r["latency_ns"]["p999"])
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.2))
+    for b, s in series.items():
+        ax1.plot(depths, s["tput"], "o-", color=BOOK_COLOR[b], label=b, linewidth=2)
+        ax2.plot(depths, s["p999"], "o-", color=BOOK_COLOR[b], label=b, linewidth=2)
+    ax1.set_xscale("log")
+    ax1.set_xlabel("price scatter (ticks from mid)  →  more price levels")
+    ax1.set_ylabel("throughput  (M commands / sec)")
+    ax1.set_title("Matching throughput by order-book structure")
+    ax1.legend(frameon=False)
+    ax1.set_ylim(bottom=0)
+
+    ax2.set_xscale("log")
+    ax2.set_yscale("log")
+    ax2.set_yticks([1000, 2000, 5000, 10000, 20000, 50000])
+    ax2.yaxis.set_major_formatter(mticker.FuncFormatter(fmt_ns))
+    ax2.yaxis.set_minor_formatter(mticker.NullFormatter())
+    ax2.set_xlabel("price scatter (ticks from mid)  →  more price levels")
+    ax2.set_ylabel("p99.9 latency")
+    ax2.set_title("Tail latency by order-book structure")
+    ax2.legend(frameon=False)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, "book_comparison.png"), dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bench", default="bench-out/core.json")
     ap.add_argument("--hist", default="bench-out/core_hist.csv")
     ap.add_argument("--snapshot", default="web/stats.json")
     ap.add_argument("--seeds-glob", default="bench-out/core_s*.json")
+    ap.add_argument("--compare-glob", default="bench-out/compare_dt*.json")
     ap.add_argument("--outdir", default="docs/images")
     a = ap.parse_args()
     os.makedirs(a.outdir, exist_ok=True)
@@ -194,6 +242,13 @@ def main():
 
     if os.path.exists(a.snapshot):
         plot_book(a.snapshot, a.outdir)
+
+    cmp_files = []
+    for p in glob.glob(a.compare_glob):
+        m = re.search(r"compare_dt(\d+)", os.path.basename(p))
+        if m:
+            cmp_files.append((int(m.group(1)), p))
+    plot_book_comparison(cmp_files, a.outdir)
 
     print(f"wrote charts to {a.outdir}/")
 

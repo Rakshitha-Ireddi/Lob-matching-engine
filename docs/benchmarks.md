@@ -107,6 +107,19 @@ run has a handful of samples in the tens-of-µs-to-ms range and typically one
 an isolated, `tickless` Linux core does not show them. They are reported
 as-measured rather than filtered.
 
+## Order-book data structure comparison
+
+`lob_bench --mode core --compare` runs the identical matching logic and order
+stream through the bitset book, a `std::map` baseline and a sorted-vector
+baseline (all three verified bit-identical by `tests/test_book_equivalence.cpp`).
+`std::map` is competitive on a shallow book and ~10–15 % / 1.5× slower as the
+book widens or the cancel rate rises; the sorted vector is 3–6× slower on a
+deep book but faster on a shallow churny one; the bitset book is the one whose
+cost stays flat across workloads. Full write-up, tables and analysis:
+**[study-order-book-structures.md](study-order-book-structures.md)**.
+
+![book comparison](images/book_comparison.png)
+
 ## Results — full pipeline (`e2e`)
 
 Client → loopback TCP → gateway → engine → gateway → client, measuring the

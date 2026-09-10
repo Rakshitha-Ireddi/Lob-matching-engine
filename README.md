@@ -110,6 +110,22 @@ cooldown throttle this 15 W chip to ~2.5 M / ~300 ns p50. Percentiles through
 p99.9 hold across all of it. Per-seed table and the tuned-Linux reference
 target: **[docs/benchmarks.md](docs/benchmarks.md)**.
 
+### Order-book structure comparison
+
+The matching engine is `template <class Book>`, so the *same* logic runs
+against the bitset book, a `std::map` baseline and a sorted-vector
+(`flat_map`) baseline — all three verified to produce bit-identical output.
+Sweeping book width and order-flow churn:
+
+![book comparison](docs/images/book_comparison.png)
+
+`std::map` stays within 0–4 % of the bitset on a shallow book but slips
+~10–15 % as the book widens and **1.5×** under a cancel-heavy stream; the
+sorted vector is **3–6×** slower (and 30–44 µs p99.9) on a deep book yet
+~8 % *faster* on a shallow churny one. The bitset book isn't universally
+fastest — it's the one whose cost stays flat across every workload. Full
+method, results and analysis: **[docs/study-order-book-structures.md](docs/study-order-book-structures.md)**.
+
 ---
 
 ## Dashboard

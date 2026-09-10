@@ -48,7 +48,11 @@ band is ~19 MB, allocated once.
 ## Consequences
 
 - Best-price and level lookups are constant-time and cache-resident for a
-  realistic book.
+  realistic book. `BasicMatchingEngine` is templated on the book type; a
+  head-to-head comparison against a `std::map` and a sorted-vector baseline is
+  in [study-order-book-structures.md](../study-order-book-structures.md). Short
+  version: the bitset book is not universally fastest, but its cost is flat
+  across book width and churn where the baselines are not.
 - Prices outside the configured band are rejected (`PRICE_OUT_OF_BAND`), which
   matches how real venues apply price bands.
 - A pathologically wide band wastes memory. Mitigation: the band is a
