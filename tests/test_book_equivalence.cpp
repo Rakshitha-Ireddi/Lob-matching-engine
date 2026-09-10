@@ -98,11 +98,18 @@ TEST(BookEquivalence, SortedVectorMatchesBitset) {
     }
 }
 
-TEST(BookEquivalence, AllThreeAgreeOnALongRun) {
+TEST(BookEquivalence, AllFourAgreeOnALongRun) {
     const Trace a = replay<OrderBook>(2024, 400'000);
-    const Trace b = replay<MapOrderBook>(2024, 400'000);
-    const Trace c = replay<SortedVectorOrderBook>(2024, 400'000);
-    EXPECT_EQ(a, b);
-    EXPECT_EQ(a, c);
+    EXPECT_EQ(a, replay<MapOrderBook>(2024, 400'000));
+    EXPECT_EQ(a, replay<PooledMapOrderBook>(2024, 400'000));
+    EXPECT_EQ(a, replay<SortedVectorOrderBook>(2024, 400'000));
     EXPECT_GT(a.events, a.trades);
+}
+
+TEST(BookEquivalence, PooledMapMatchesMap) {
+    for (std::uint64_t seed : {1u, 42u, 777u}) {
+        EXPECT_EQ(replay<MapOrderBook>(seed, 150'000),
+                  replay<PooledMapOrderBook>(seed, 150'000))
+            << "seed " << seed;
+    }
 }

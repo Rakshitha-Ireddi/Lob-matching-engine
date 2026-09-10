@@ -4,23 +4,35 @@
 #include <cstddef>
 #include <functional>
 #include <map>
+#include <memory>
+#include <utility>
 #include <vector>
 
+#include "lob/node_pool_allocator.hpp"
 #include "lob/order.hpp"
 #include "lob/price_level.hpp"
 #include "lob/types.hpp"
 
 namespace lob {
 
-// Baseline order book: one ordered `std::map<Price, PriceLevel>` per side.
+// Baseline order book: one ordered map of price -> PriceLevel per side.
 //
-// The textbook implementation. Level lookup, insert and erase are O(log n);
+// The textbook implementation. Level lookup, insert and erase are O(log L);
 // the best price is `begin()`, O(1). It exists as the comparison baseline for
 // the bitset book -- identical public surface and the same PriceLevel FIFO, so
-// `BasicMatchingEngine` runs against either unchanged. See docs/benchmarks.md.
-class MapOrderBook {
+// `BasicMatchingEngine` runs against either unchanged.
+//
+// Templated on the node allocator so the study can measure a pooled-allocator
+// variant against `std::allocator` -- see docs/study-order-book-structures.md.
+template <template <class> class Alloc = std::allocator>
+class BasicMapOrderBook {
+    using BidMap = std::map<Price, PriceLevel, std::greater<Price>,
+                            Alloc<std::pair<const Price, PriceLevel>>>;
+    using AskMap = std::map<Price, PriceLevel, std::less<Price>,
+                            Alloc<std::pair<const Price, PriceLevel>>>;
+
 public:
-    MapOrderBook(Price min_price, Price max_price)
+    BasicMapOrderBook(Price min_price, Price max_price)
         : min_price_(min_price), max_price_(max_price) {}
 
     [[nodiscard]] bool in_band(Price p) const noexcept {
@@ -129,9 +141,13 @@ private:
 
     Price min_price_;
     Price max_price_;
-    std::map<Price, PriceLevel, std::greater<Price>> bid_;  // begin() == best bid
-    std::map<Price, PriceLevel, std::less<Price>> ask_;     // begin() == best ask
+    BidMap bid_;  // begin() == best bid
+    AskMap ask_;  // begin() == best ask
     std::size_t count_[2] = {0, 0};
 };
+
+// std::allocator baseline and pooled-node variant.
+using MapOrderBook       = BasicMapOrderBook<std::allocator>;
+using PooledMapOrderBook = BasicMapOrderBook<NodePoolAllocator>;
 
 }  // namespace lob

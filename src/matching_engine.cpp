@@ -357,6 +357,7 @@ void BasicMatchingEngine<Book>::handle_modify(const Command& cmd) noexcept {
 // --- explicit instantiations ---------------------------------------------
 template class BasicMatchingEngine<OrderBook>;
 template class BasicMatchingEngine<MapOrderBook>;
+template class BasicMatchingEngine<PooledMapOrderBook>;
 template class BasicMatchingEngine<SortedVectorOrderBook>;
 
 }  // namespace lob
