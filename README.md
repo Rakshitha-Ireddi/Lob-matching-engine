@@ -115,16 +115,20 @@ target: **[docs/benchmarks.md](docs/benchmarks.md)**.
 The matching engine is `template <class Book>`, so the *same* logic runs
 against the bitset book, a `std::map` baseline and a sorted-vector
 (`flat_map`) baseline — all three verified to produce bit-identical output.
-Sweeping book width and order-flow churn:
+Sweeping book width and order-flow churn on **two machines** (Windows dev box,
+Linux CI):
 
-![book comparison](docs/images/book_comparison.png)
+![two platforms](docs/images/book_platforms.png)
 
-`std::map` stays within 0–4 % of the bitset on a shallow book but slips
-~10–15 % as the book widens and **1.5×** under a cancel-heavy stream; the
-sorted vector is **3–6×** slower (and 30–44 µs p99.9) on a deep book yet
-~8 % *faster* on a shallow churny one. The bitset book isn't universally
-fastest — it's the one whose cost stays flat across every workload. Full
-method, results and analysis: **[docs/study-order-book-structures.md](docs/study-order-book-structures.md)**.
+The `std::map` vs bitset ranking **flips between the two hosts** — it's an
+allocator contest (Windows's heap punishes `std::map`'s node churn; glibc
+doesn't), not an algorithm one, and cachegrind confirms the D1 miss-rate gap
+is small (1.8 % vs 2.2 %). What holds on **both**: the sorted vector degrades
+badly on a deep book (Windows 6×, Linux 1.5×, tens of µs p99.9), and the
+bitset has the flattest tail across every configuration. It's the *safe*
+choice, not the fastest. Full method, cross-platform results, cachegrind and
+analysis: **[docs/study-order-book-structures.md](docs/study-order-book-structures.md)**
+(reproduced by the `order-book study` GitHub Actions workflow).
 
 ---
 

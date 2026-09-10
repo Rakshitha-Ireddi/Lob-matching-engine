@@ -49,10 +49,14 @@ band is ~19 MB, allocated once.
 
 - Best-price and level lookups are constant-time and cache-resident for a
   realistic book. `BasicMatchingEngine` is templated on the book type; a
-  head-to-head comparison against a `std::map` and a sorted-vector baseline is
-  in [study-order-book-structures.md](../study-order-book-structures.md). Short
-  version: the bitset book is not universally fastest, but its cost is flat
-  across book width and churn where the baselines are not.
+  cross-platform comparison against a `std::map` and a sorted-vector baseline
+  is in [study-order-book-structures.md](../study-order-book-structures.md).
+  Short version: the bitset book is **not** reliably faster than `std::map` —
+  that contest is decided by the system allocator and the ranking flips between
+  Windows and Linux. What the bitset buys, on every host, is a **flat tail**
+  (p99.9 stable across book width and churn) and no O(L) cliff. The sorted
+  vector has that cliff; `std::map` has an allocator dependency. This ADR
+  stands: predictability is the property we want in the matching path.
 - Prices outside the configured band are rejected (`PRICE_OUT_OF_BAND`), which
   matches how real venues apply price bands.
 - A pathologically wide band wastes memory. Mitigation: the band is a

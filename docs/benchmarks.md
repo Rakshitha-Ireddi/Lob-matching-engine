@@ -111,14 +111,14 @@ as-measured rather than filtered.
 
 `lob_bench --mode core --compare` runs the identical matching logic and order
 stream through the bitset book, a `std::map` baseline and a sorted-vector
-baseline (all three verified bit-identical by `tests/test_book_equivalence.cpp`).
-`std::map` is competitive on a shallow book and ~10–15 % / 1.5× slower as the
-book widens or the cancel rate rises; the sorted vector is 3–6× slower on a
-deep book but faster on a shallow churny one; the bitset book is the one whose
-cost stays flat across workloads. Full write-up, tables and analysis:
-**[study-order-book-structures.md](study-order-book-structures.md)**.
+baseline (all three verified bit-identical by `tests/test_book_equivalence.cpp`),
+on this Windows box **and** on a Linux CI runner. The `std::map` vs bitset
+ranking **flips between the two** — it turns on the system allocator, not the
+algorithm. What holds on both: the sorted vector degrades badly on a deep book
+and the bitset has the flattest tail. Full cross-platform write-up, cachegrind
+and analysis: **[study-order-book-structures.md](study-order-book-structures.md)**.
 
-![book comparison](images/book_comparison.png)
+![two platforms](images/book_platforms.png)
 
 ## Results — full pipeline (`e2e`)
 

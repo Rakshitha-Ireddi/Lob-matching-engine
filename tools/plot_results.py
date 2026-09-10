@@ -217,6 +217,48 @@ def plot_book_comparison(compare_files, outdir):
     plt.close(fig)
 
 
+def _ratios(compare_files):
+    """{book: {depth: throughput_ratio_vs_bitset}} from a list of (depth, path)."""
+    out = {"map": {}, "flat": {}}
+    for depth, path in compare_files:
+        runs = {r["mode"].split("/")[-1]: r["throughput_ops"]
+                for r in json.load(open(path))["runs"]}
+        base = runs.get("bitset")
+        if not base:
+            continue
+        for b in out:
+            if b in runs:
+                out[b][depth] = base / runs[b]   # >1 = slower than bitset
+    return out
+
+
+def plot_book_platforms(win_files, lin_files, outdir):
+    if not win_files or not lin_files:
+        return
+    win = _ratios(sorted(win_files))
+    lin = _ratios(sorted(lin_files))
+    fig, ax = plt.subplots(figsize=(8.5, 4.4))
+    for b, style in (("map", "-"), ("flat", "--")):
+        wd = sorted(win[b])
+        ax.plot(wd, [win[b][d] for d in wd], style, marker="o",
+                color=BOOK_COLOR[b], linewidth=2, label=f"{b}  ·  Windows / i3")
+        ld = sorted(lin[b])
+        ax.plot(ld, [lin[b][d] for d in ld], style, marker="s", markerfacecolor="white",
+                color=BOOK_COLOR[b], linewidth=2, alpha=0.85,
+                label=f"{b}  ·  Linux CI / i7")
+    ax.axhline(1.0, color="#444", linewidth=1)
+    ax.annotate("bitset baseline", (ax.get_xlim()[1], 1.0), fontsize=9,
+                ha="right", va="bottom", color="#444")
+    ax.set_xscale("log")
+    ax.set_xlabel("price scatter (ticks from mid)  →  more price levels")
+    ax.set_ylabel("throughput ratio vs bitset   (>1 = slower)")
+    ax.set_title("Same code, two machines: the map/bitset ranking flips with the allocator")
+    ax.legend(frameon=False, fontsize=9, ncol=2)
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, "book_platforms.png"), dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bench", default="bench-out/core.json")
@@ -243,12 +285,17 @@ def main():
     if os.path.exists(a.snapshot):
         plot_book(a.snapshot, a.outdir)
 
-    cmp_files = []
-    for p in glob.glob(a.compare_glob):
-        m = re.search(r"compare_dt(\d+)", os.path.basename(p))
-        if m:
-            cmp_files.append((int(m.group(1)), p))
+    def _cmp_list(pattern):
+        out = []
+        for p in glob.glob(pattern):
+            m = re.search(r"compare_dt(\d+)", os.path.basename(p))
+            if m:
+                out.append((int(m.group(1)), p))
+        return out
+
+    cmp_files = _cmp_list(a.compare_glob)
     plot_book_comparison(cmp_files, a.outdir)
+    plot_book_platforms(cmp_files, _cmp_list("bench-out/linux-ci/compare_dt*.json"), a.outdir)
 
     print(f"wrote charts to {a.outdir}/")
 

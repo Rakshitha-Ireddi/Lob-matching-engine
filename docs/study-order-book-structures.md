@@ -13,31 +13,44 @@ deterministic order stream through three different order-book data structures:
 | **`std::map`** | one `std::map<Price, PriceLevel>` per side | O(log L) | O(1) (`begin()`) | O(log L) |
 | **sorted `std::vector`** | one price-sorted `vector` per side (a `flat_map`) | O(log L) | O(1) (`front()`) | **O(L)** memmove |
 
-(L = number of occupied price levels.)
+(L = number of occupied price levels.) 10 M commands per run.
 
-**Findings on an i3-1125G4 (Windows, GCC 16.2 `-O3`), 10 M commands per run:**
+This was measured on **two machines**, and the result is a caution about
+single-machine benchmarks:
 
-1. `std::map` is **within 0–4 %** of the bitset book on a *shallow* book
-   (tens–hundreds of levels) and falls **~10–15 % behind** as the book widens to
-   thousands of levels — the tree spills cache and every op eats `log L`
-   pointer-chases. Under a **cancel-heavy** stream (50 % cancels) it is **1.5×
-   slower** because of tree rebalancing on every level create/destroy.
-2. The **sorted vector is a trap for a deep book**: 1.8× slower at ~hundreds of
-   levels, **3–6× slower** and a p99.9 of **30–44 µs** (vs ~3 µs) at thousands
-   of levels, because every level insert/erase memmoves the tail of the array.
-   But on a *shallow, churny* book it is actually **~8 % faster** than the
-   bitset — a small contiguous array with cheap memmoves beats a fixed-width
-   bit-scan.
-3. The **bitset book is the most predictable**: p99.9 stays **~2–4 µs across
-   every configuration**, where `std::map` drifts up and the vector explodes.
-   Its one structural cost is that `best_price` scans a bitset sized to the
-   configured price *band*, not the live level count — so on a shallow book it
-   carries dead weight it cannot shed.
+| | Windows / i3-1125G4 / GCC 16.2 (dev box) | Linux / i7-4910MQ / GCC 13.3 (GitHub CI) |
+|---|---|---|
+| `std::map` vs bitset, shallow book | 1.0–1.04× slower | **0.92× — *faster*** |
+| `std::map` vs bitset, wide book | ~1.1–1.15× slower | ~1.0× (equal) |
+| `std::map` vs bitset, cancel-heavy | **1.5× slower** | **0.75× — much faster** |
+| sorted vector, wide book | **3–6× slower**, 30–44 µs p99.9 | **1.5× slower**, ~3 µs p99.9 |
+| sorted vector, shallow / churny | ~1.0× (par or a hair faster) | **0.70× — faster** |
 
-The honest conclusion is **not** "the bitset book wins." It is: *the bitset book
-is the safe default because its cost is flat across workloads; a sorted vector
-is right only for shallow high-churn books; `std::map` is fine until the book
-gets wide or the cancel rate gets high.*
+**The one finding that holds on both machines:** the **sorted vector degrades on
+a deep book** — O(L) memmove on every level insert/erase — and the **bitset has
+the flattest tail**. Everything else about `std::map` is a wash or a reversal
+between the two hosts.
+
+**Why the flip.** `std::map` does a heap allocation and free on every price
+level that is created or destroyed. Windows's default heap makes that
+expensive; glibc's `malloc` (with its per-thread arenas and fast bins) makes it
+cheap enough that the tree's O(log L) beats the bitset's fixed O(band/64)
+best-price scan. Same C++, same `libstdc++`, opposite ranking — because the
+allocator underneath is different.
+
+![two platforms](images/book_platforms.png)
+
+**So the honest conclusion is not "the bitset book wins."** It is:
+
+- The **bitset book is the *safe* choice** — its cost (and especially its tail)
+  is flat across book width, churn *and host*, where the baselines are not. It
+  is rarely the fastest and never close to the slowest.
+- Its structural price: `best_price` scans a bitset sized to the configured
+  price *band*, not the live level count, so on a shallow book it carries dead
+  weight. Size the band to the instrument.
+- `std::map` is a perfectly reasonable choice on Linux; on a platform with a
+  slow allocator, or under heavy level churn, it is the one to avoid.
+- The **sorted vector is only ever right for a book that stays shallow.**
 
 ## Why this is worth measuring
 
@@ -68,103 +81,122 @@ across four seeds. So the only variable between runs is the data structure.
 
 ## Results
 
-### Throughput and tail vs book width
+### Windows dev box (i3-1125G4, GCC 16.2, pinned)
 
 `lob_bench --mode core --events 10000000 --seed 1 --pin --cpu 3 --depth-ticks <D> --compare`
 
-| depth-ticks | book | throughput | ns/cmd | p50 | p99 | p99.9 | vs bitset |
-|---:|---|---:|---:|---:|---:|---:|---:|
-| **16** (shallow) | bitset | 3.95 M/s | 253 | 173 ns | 707 ns | 1.99 µs | 1.00× |
-| | map | 3.94 M/s | 254 | 179 ns | 680 ns | 2.13 µs | 1.00× |
-| | flat | 3.19 M/s | 313 | 176 ns | 3.80 µs | 8.28 µs | 1.24× |
-| **48** | bitset | 3.67 M/s | 272 | 188 ns | 751 ns | 3.48 µs | 1.00× |
-| | map | 3.54 M/s | 283 | 197 ns | 764 ns | 3.00 µs | 1.04× |
-| | flat | 2.08 M/s | 482 | 228 ns | 6.34 µs | 14.7 µs | 1.77× |
-| **200** | bitset | 3.27 M/s | 306 | 222 ns | 839 ns | 4.01 µs | 1.00× |
-| | map | 2.94 M/s | 341 | 267 ns | 871 ns | 3.90 µs | 1.11× |
-| | flat | 1.04 M/s | 965 | 307 ns | 14.0 µs | 29.2 µs | 3.16× |
-| **800** (wide) | bitset | 3.44 M/s | 290 | 215 ns | 744 ns | 3.26 µs | 1.00× |
-| | map | 2.98 M/s | 335 | 258 ns | 871 ns | 3.11 µs | 1.15× |
-| | flat | 0.56 M/s | 1776 | 292 ns | 25.9 µs | 44.4 µs | 6.12× |
+| depth-ticks | book | throughput | p50 | p99 | p99.9 | vs bitset |
+|---:|---|---:|---:|---:|---:|---:|
+| **16** (shallow) | bitset | 3.95 M/s | 173 ns | 707 ns | 1.99 µs | 1.00× |
+| | map | 3.94 M/s | 179 ns | 680 ns | 2.13 µs | 1.00× |
+| | flat | 3.19 M/s | 176 ns | 3.80 µs | 8.28 µs | 1.24× |
+| **48** | bitset | 3.67 M/s | 188 ns | 751 ns | 3.48 µs | 1.00× |
+| | map | 3.54 M/s | 197 ns | 764 ns | 3.00 µs | 1.04× |
+| | flat | 2.08 M/s | 228 ns | 6.34 µs | 14.7 µs | 1.77× |
+| **200** | bitset | 3.27 M/s | 222 ns | 839 ns | 4.01 µs | 1.00× |
+| | map | 2.94 M/s | 267 ns | 871 ns | 3.90 µs | 1.11× |
+| | flat | 1.04 M/s | 307 ns | 14.0 µs | 29.2 µs | 3.16× |
+| **800** (wide) | bitset | 3.44 M/s | 215 ns | 744 ns | 3.26 µs | 1.00× |
+| | map | 2.98 M/s | 258 ns | 871 ns | 3.11 µs | 1.15× |
+| | flat | 0.56 M/s | 292 ns | 25.9 µs | 44.4 µs | 6.12× |
 
-The `depth-ticks 200` row was re-run on seeds 2 and 3: `map` came out 1.14× and
-1.05× — i.e. the ~1.1× gap is real, not noise.
+Cancel-heavy stream (`--depth-ticks 120 --p-new 0.44 --p-cancel 0.5`):
+bitset 3.21 M/s · map 2.13 M/s (**1.51×**) · flat 3.46 M/s (**0.93×**).
 
 ![book comparison](images/book_comparison.png)
 
-### Cancel-heavy stream
+### Linux CI (i7-4910MQ, GCC 13.3, GitHub runner, not pinned)
 
-`--depth-ticks 120 --p-new 0.44 --p-cancel 0.5 --compare` (50 % of commands are
-cancels → constant level creation and destruction):
+From the [`order-book study` workflow](../.github/workflows/book-study.yml),
+committed under [`bench-out/linux-ci/`](../bench-out/linux-ci/). Latency on the
+runner is VM-noisy and quantised — **read the throughput, not the ns**.
 
-| book | throughput | p50 | p99 | p99.9 | vs bitset |
-|---|---:|---:|---:|---:|---:|
-| bitset | 3.21 M/s | 222 ns | 934 ns | 3.66 µs | 1.00× |
-| map | 2.13 M/s | 369 ns | 1.51 µs | 4.22 µs | **1.51×** |
-| flat | 3.46 M/s | 198 ns | 758 ns | 2.59 µs | **0.93×** |
+| depth-ticks | bitset | map (vs bit) | flat (vs bit) |
+|---:|---:|---:|---:|
+| **48** | 4.25 M/s | 4.61 M/s (**0.92×**) | 4.25 M/s (1.00×) |
+| **200** | 4.10 M/s | 4.31 M/s (**0.95×**) | 3.63 M/s (1.13×) |
+| **800** | 4.01 M/s | 4.01 M/s (1.00×) | 2.64 M/s (1.52×) |
+| **churn 50 %** | 3.98 M/s | 5.29 M/s (**0.75×**) | 5.69 M/s (**0.70×**) |
+
+On Linux the map/bitset gap **inverts** — `std::map` is level with or faster
+than the bitset at every point, and *much* faster under churn. The sorted
+vector still degrades on a deep book (1.5×) but nowhere near the 6× seen on
+Windows.
+
+### Book-only microbench (`lob_bench --mode book`)
+
+Matching removed — pure `add` / `remove` / `best_bid` / `best_ask` / `snapshot`.
+Isolates the structure. Linux CI, 5 M ops:
+
+| depth-ticks | bitset | map | flat |
+|---:|---:|---:|---:|
+| 48 | 129 ns/op | 139 ns (1.08×) | 141 ns (1.09×) |
+| 400 | 128 ns/op | 163 ns (1.27×) | 160 ns (1.25×) |
+
+With matching stripped out, the bitset's O(1) *does* show — ~25 % faster per
+op on a deep book. In the full engine that advantage is diluted by the
+matching work (walking FIFO queues, emitting events) that every book shares.
+
+### Cachegrind (Linux CI, depth-ticks 200, 400 k book ops)
+
+| book | D1 miss rate | LLd miss rate | I refs |
+|---|---:|---:|---:|
+| bitset | **1.8 %** | 1.4 % | 663 M |
+| map | **2.2 %** | 1.4 % | 558 M |
+| flat | 2.0 % | 1.4 % | 586 M |
+
+`std::map` has the highest D1 miss rate (2.2 % vs 1.8 %) — the tree-descent
+cache misses are real and measurable, just *small*. The bitset retires the most
+instructions (the band scan), which is why on a fast allocator it does not win
+on throughput despite the lower miss rate: its extra instructions are
+straight-line and branch-predictable, cachegrind's `--branch-sim=no` model
+does not credit that.
 
 ## Analysis
 
-**Why `std::map` keeps up on a shallow book.** With a few hundred levels the
-red-black tree is a few kilobytes and stays resident in L1/L2. `log L ≈ 8`
-comparisons per op is cheap when every node is a cache hit. The bitset's O(1)
-is a smaller constant, not a different order of magnitude, at this L.
+**`std::map` vs the bitset is an allocator contest, not an algorithm contest.**
+Every price level created or destroyed is a `map` node `new`/`delete`. At L in
+the hundreds–thousands the tree itself is a few tens of KB and the `log L`
+descent is cheap; the cost that actually moves is allocation. Windows's default
+heap makes node churn expensive enough that the bitset's bit-flip wins by
+10–50 %. glibc's `malloc` makes it cheap enough that `std::map` wins. The
+cachegrind D1 gap (1.8 % → 2.2 %) is the secondary effect and it is minor.
 
-**Why `std::map` slips as the book widens.** At thousands of levels the tree no
-longer fits in L1; each of the `log L` steps down the tree is an increasingly
-likely cache miss, and node allocation/free on level churn touches the
-allocator. The bitset touches at most `band/64` contiguous machine words for a
-best-price scan and a single word for an add/cancel — its cache footprint does
-not grow with L.
+**The bitset's structural cost is real and platform-independent.**
+`best_price` is `O(band / 64)` regardless of L. With a 200 k-tick band and only
+a few hundred live levels, that is thousands of empty words scanned on every
+top-of-book query. Both baselines are `O(1)` here (`begin()` / `front()`).
+This is the fixed tax the bitset pays for its predictability, and it is why it
+never wins by a wide margin.
 
-**Why `std::map` collapses under churn.** Every cancel that empties a level is a
-`map::erase` (rebalance + free); every new level is an `insert` (allocate +
-rebalance). The bitset makes both a single bit flip.
-
-**Why the sorted vector is fine when shallow and churny, fatal when wide.**
-Insert/erase of a level is `memmove` of the array tail — O(L). When L is small
-(≤ ~50) and the array is hot, that memmove is a handful of cache lines and
-beats scanning a band-sized bitset. When L is thousands, every level change
-shifts kilobytes, and because a cancel-heavy deep book changes levels
-constantly, throughput falls off a cliff and the tail balloons to tens of µs.
-
-**The bitset's structural cost.** `best_price` is `O(band / 64)` no matter how
-few levels exist. Configure a 200 k-tick band and trade a stock that only uses
-200 levels and you pay for 199 800 empty ticks on every top-of-book query.
-Both baselines are `O(1)` here (`begin()` / `front()`). This is why the bitset
-never *wins* by a wide margin — and why a real deployment sizes the band to the
-instrument.
+**The sorted vector is the only structure with a genuinely bad asymptote for
+this workload.** Level insert/erase is `memmove` of the array tail — O(L). On a
+shallow book (L ≤ ~50) that is a few cache lines and it is competitive or
+faster. On a wide book each level change shifts kilobytes; a cancel-heavy wide
+book changes levels constantly, and throughput falls off a cliff (Windows 6×,
+Linux 1.5×) with a p99.9 in the tens of µs.
 
 ## Threats to validity
 
-- **One CPU, thermally throttled, Windows.** Absolute throughput drifts
-  1.8–3.9 M/s across the session; only the within-run `vs bitset` ratios are
-  trustworthy. A tuned Linux host with `isolcpus` would tighten every number
-  and lower the tails, but the *relative* ordering is a property of the
-  algorithms, not the box.
-- **Cache behaviour is measured in CI, not on this box.** The
-  [`order-book study` workflow](../.github/workflows/book-study.yml) re-runs
-  everything on a Linux runner and adds:
-  - `lob_bench --mode book` — a **book-only microbench** that replays the same
-    flow applying *only* `add` / `remove` / `best_bid` / `best_ask` / `snapshot`
-    (no matching, no events), so a cache tool attributes every difference to the
-    data structure. On this Windows box it already shows the isolated gap is
-    larger than the full-engine gap (bitset p50 ~31 ns vs ~60 ns for the
-    baselines at `depth-ticks 48`, where matching work had diluted it to
-    ~5 %).
-  - **cachegrind** (`--cache-sim=yes`) per book — deterministic simulated D1 /
-    LL miss rates, CPU-independent.
-  - **`perf stat`** hardware counters, best-effort (most CI runners block the
-    PMU; the step is `|| true`).
-  Results land in the workflow's **job summary** and as a downloadable
-  `order-book-study` artifact.
+- **Two machines, both imperfect.** The Windows box thermally throttles
+  (throughput drifts 1.8–3.9 M/s across a session); the CI runner is a shared
+  VM with a noisy, quantised `rdtsc`. Only the *within-run* `vs bitset` ratios
+  are load-bearing, and the headline result is exactly that those ratios
+  **disagree between the two hosts** — which is the point.
+- **`perf` hardware counters were not obtained.** The CI runner sets
+  `perf_event_paranoid = 4`, so `perf stat` is blocked (the step is `|| true`
+  and records the failure). The cache evidence here is cachegrind's *simulated*
+  model. Real PMU counters would need a self-hosted runner or bare metal.
 - **Synthetic order flow.** The generator is a reasonable zero-intelligence
-  model but not a replay of a real venue. Book width and churn are the levers
-  that matter for this comparison and both are swept, but a real ITCH replay
-  would be a stronger workload.
-- **`std::map` node allocator.** Default `std::allocator`; a pooled node
-  allocator would narrow the churn gap. Out of scope here — the point is what
-  you get from the standard container as written.
+  model but not a replay of a real venue. Book width and churn — the levers
+  that matter here — are both swept, but a real ITCH replay would be stronger.
+- **`std::map` node allocator.** Default `std::allocator` on top of the system
+  malloc. That is deliberately the variable this study ended up isolating; a
+  pooled node allocator would likely erase the Windows gap. What you get from
+  the standard container, unmodified, on two common platforms is the point.
+- **Only two hosts, two compilers.** The direction of the map/bitset result
+  should not be trusted beyond "it is allocator-sensitive; measure on your
+  target." The sorted-vector and tail-stability findings held on both.
 
 ## Reproduce
 
