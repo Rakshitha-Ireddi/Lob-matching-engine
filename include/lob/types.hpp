@@ -26,6 +26,15 @@ enum class Side : std::uint8_t { Buy = 0, Sell = 1 };
     return s == Side::Buy ? Side::Sell : Side::Buy;
 }
 
+// Does an aggressor on `side` at `limit` cross a resting level priced at
+// `level_price`? A market order (limit == kNoPrice) always crosses. Shared by
+// every order-book implementation.
+[[nodiscard]] inline constexpr bool crosses(Side side, Price limit,
+                                            Price level_price) noexcept {
+    if (limit == kNoPrice) return true;
+    return side == Side::Buy ? limit >= level_price : limit <= level_price;
+}
+
 // Order handling instructions.
 enum class OrderType : std::uint8_t {
     Limit    = 0,  // rest the unfilled remainder

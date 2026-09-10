@@ -118,11 +118,10 @@ public:
         return (b == kNoPrice || a == kNoPrice) ? kNoPrice : a - b;
     }
 
-    // Does an aggressor on `side` at `limit` cross a resting level priced at
-    // `level_price`? Market orders (limit == kNoPrice) always cross.
+    // Convenience forwarder to lob::crosses (kept for call sites that spell it
+    // OrderBook::crosses).
     [[nodiscard]] static bool crosses(Side side, Price limit, Price level_price) noexcept {
-        if (limit == kNoPrice) return true;
-        return side == Side::Buy ? limit >= level_price : limit <= level_price;
+        return lob::crosses(side, limit, level_price);
     }
 
     // Total resting quantity an aggressor on `side` could take at `limit`,
@@ -157,11 +156,7 @@ public:
     }
 
     // Depth snapshot: up to `max_levels` price points per side, best first.
-    struct DepthEntry {
-        Price price;
-        Quantity qty;
-        std::uint32_t orders;
-    };
+    using DepthEntry = lob::DepthEntry;
     void snapshot(Side s, std::size_t max_levels, std::vector<DepthEntry>& out) const {
         out.clear();
         const PriceLevel* lvl = best_level(s);

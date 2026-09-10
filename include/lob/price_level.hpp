@@ -6,6 +6,13 @@
 
 namespace lob {
 
+// One row of a depth snapshot, produced by every book implementation.
+struct DepthEntry {
+    Price         price;
+    Quantity      qty;
+    std::uint32_t orders;
+};
+
 // One price point in the book: a FIFO queue of orders plus cached aggregates.
 struct PriceLevel {
     Price         price     = kNoPrice;
