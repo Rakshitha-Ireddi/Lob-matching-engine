@@ -100,6 +100,7 @@ if(LOB_BUILD_TESTS)
     tests/test_latency_histogram.cpp
     tests/test_wire.cpp
     tests/test_determinism.cpp
+    tests/test_book_equivalence.cpp
   )
   target_link_libraries(lob_tests PRIVATE lob_core GTest::gtest_main)
 
